@@ -1,0 +1,19 @@
+[package]
+name = "attos-client"
+version = "0.1.0"
+edition = "2021"
+description = "Zero-Latency State Distribution Engine SDK for Rust"
+
+[dependencies]
+memmap2 = "0.9.3"
+twox-hash = "1.6.3"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+arc-swap = "1.7.1"
+bytes = "1.5"
+crc32fast = "1.4"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3.8.1"
+allocation-counter = "0.8.1"
