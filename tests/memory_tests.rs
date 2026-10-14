@@ -6,7 +6,9 @@ use std::io::Write;
 #[test]
 fn test_multi_lookup_zero_allocation() {
     // Generate a tiny mock attos file just for this test
-    let test_path = "tests/mock_multi.attos";
+    let dir = tempfile::tempdir().unwrap();
+    let test_path_buf = dir.path().join("mock_multi.attos");
+    let test_path = test_path_buf.to_str().unwrap();
     let mut file = File::create(test_path).unwrap();
     // Just writing a minimal header so AttosMap::open won't panic on size,
     // though this test is strictly measuring allocation on the method boundary.
@@ -36,7 +38,12 @@ fn test_multi_lookup_zero_allocation() {
     buf[blob_offset+2..blob_offset+7].copy_from_slice(b"a\x00b\x00c");
     buf[blob_offset+7..blob_offset+10].copy_from_slice(b"xyz");
     
-    file.write_all(&buf[..blob_offset+10]).unwrap();
+    // v1 blobs always carry a CRC32 trailer (CONTRACTS §1.1).
+    let mut h = crc32fast::Hasher::new();
+    h.update(&buf[..blob_offset+10]);
+    let crc = h.finalize();
+    buf[blob_offset+10..blob_offset+14].copy_from_slice(&crc.to_be_bytes());
+    file.write_all(&buf[..blob_offset+14]).unwrap();
     file.sync_all().unwrap();
 
     let map = AttosMap::open(test_path).unwrap();
@@ -59,7 +66,6 @@ fn test_multi_lookup_zero_allocation() {
     let elapsed = start.elapsed();
     
     // Cleanup
-    std::fs::remove_file(test_path).unwrap();
     
     assert!(elapsed.as_millis() < 3000, "1M lookups took too long, hinting at allocations: {:?}", elapsed);
 }
