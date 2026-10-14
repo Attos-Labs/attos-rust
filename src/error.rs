@@ -11,6 +11,7 @@ pub enum AttosError {
     MapClosed,
     MlockFailed(io::Error),
     IoError(io::Error),
+    Utf8Error(std::str::Utf8Error),
 }
 
 impl fmt::Display for AttosError {
@@ -26,6 +27,7 @@ impl fmt::Display for AttosError {
             AttosError::MapClosed => write!(f, "map closed"),
             AttosError::MlockFailed(e) => write!(f, "mlock failed: {}", e),
             AttosError::IoError(e) => write!(f, "io error: {}", e),
+            AttosError::Utf8Error(e) => write!(f, "utf-8 error: {}", e),
         }
     }
 }
@@ -35,5 +37,11 @@ impl std::error::Error for AttosError {}
 impl From<io::Error> for AttosError {
     fn from(e: io::Error) -> Self {
         AttosError::IoError(e)
+    }
+}
+
+impl From<std::str::Utf8Error> for AttosError {
+    fn from(e: std::str::Utf8Error) -> Self {
+        AttosError::Utf8Error(e)
     }
 }
