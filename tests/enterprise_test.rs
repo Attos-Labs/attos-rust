@@ -192,7 +192,7 @@ fn test_adversarial_fuzzing() {
 
     for (corruption, expect_err) in tests {
         let (_dir, path) = generate_corrupt_attos(corruption);
-        let res = AttosMap::open_with_config(&path, OpenConfig { validate_checksum: true, pin_to_memory: false });
+        let res = AttosMap::open_with_config(&path, OpenConfig { validate_checksum: true, pin_to_memory: false, ..Default::default() });
         assert_eq!(res.is_err(), expect_err, "failed on {}", corruption);
     }
 }
