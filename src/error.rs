@@ -1,5 +1,6 @@
 use std::fmt;
 use std::io;
+use std::time::Duration;
 
 #[derive(Debug)]
 pub enum AttosError {
@@ -12,6 +13,20 @@ pub enum AttosError {
     MlockFailed(io::Error),
     IoError(io::Error),
     Utf8Error(std::str::Utf8Error),
+    /// Sync endpoint answered with a non-200/304 status. `retry_after` is set
+    /// for 402/429 when the server sent `Retry-After`.
+    HttpStatus { code: u16, retry_after: Option<Duration> },
+    /// Network/transport failure or a body shorter than `Content-Length`.
+    Transport(String),
+    /// Configuration error (e.g. invalid node id).
+    Config(String),
+}
+
+impl AttosError {
+    /// 402 / 429: node or quota limit.
+    pub fn is_quota(&self) -> bool {
+        matches!(self, AttosError::HttpStatus { code: 402 | 429, .. })
+    }
 }
 
 impl fmt::Display for AttosError {
@@ -22,12 +37,18 @@ impl fmt::Display for AttosError {
             AttosError::InvalidMagic => write!(f, "invalid magic bytes"),
             AttosError::InvalidVersion(v) => write!(f, "invalid version: {}", v),
             AttosError::ChecksumMismatch { expected, actual } => {
-                write!(f, "checksum mismatch: expected {}, got {}", expected, actual)
+                write!(f, "checksum mismatch: trailer {:#010x}, computed {:#010x}", expected, actual)
             }
             AttosError::MapClosed => write!(f, "map closed"),
             AttosError::MlockFailed(e) => write!(f, "mlock failed: {}", e),
             AttosError::IoError(e) => write!(f, "io error: {}", e),
             AttosError::Utf8Error(e) => write!(f, "utf-8 error: {}", e),
+            AttosError::HttpStatus { code, retry_after } => match retry_after {
+                Some(d) => write!(f, "sync: HTTP {} (retry after {:?})", code, d),
+                None => write!(f, "sync: HTTP {}", code),
+            },
+            AttosError::Transport(e) => write!(f, "sync transport error: {}", e),
+            AttosError::Config(e) => write!(f, "configuration error: {}", e),
         }
     }
 }

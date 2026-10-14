@@ -1,251 +1,393 @@
 use memmap2::{Mmap, MmapOptions};
 use std::fs::File;
-use std::path::Path;
-use std::time::Duration;
-use twox_hash::XxHash64;
 use std::hash::Hasher;
-use crc32fast::Hasher as Crc32Hasher;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+use twox_hash::XxHash64;
 
-use tracing::{debug, error, info, instrument, warn};
+use crc32fast::Hasher as Crc32Hasher;
+use tracing::{debug, info, instrument, warn};
 
 use crate::error::AttosError;
+use crate::stats::LatencyHistogram;
 
 const MAGIC_ATTO: &[u8; 4] = b"ATTO";
+/// Fixed v1 header length (CONTRACTS.md §1.1).
+pub const HEADER_SIZE: usize = 33;
 
 /// Configuration applied when opening a `.attos` / `.nh` binary file.
 ///
 /// All fields are optional; zero/`false`/`None` selects safe production defaults.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OpenConfig {
-    /// Verify the CRC32-IEEE trailer appended by the Go builder.
-    /// Enable on startup; disable on the hot path.
-    /// Default: `false`.
+    /// Verify the CRC32-IEEE trailer before the map is exposed.
+    /// The synchronizer always validates downloaded blobs regardless of this flag.
+    /// Default: `false` (direct `open` only).
     pub validate_checksum: bool,
 
     /// Call `mlock(2)` on the mapped region to prevent OS page-outs.
-    /// Recommended for latency-critical deployments.
+    /// Failure is non-fatal (a warning is logged), matching the Go and Java SDKs.
     /// Default: `false`.
     pub pin_to_memory: bool,
 
-    /// Polling interval for background cloud sync used by `AttosClient::start_sync`.
-    /// `None` disables automatic polling (manual `reload` calls only).
-    /// Default: `None`.
+    /// Polling interval for background cloud sync used by `AttosSynchronizer`.
+    /// `None` selects the default (`DEFAULT_SYNC_INTERVAL`, 30 s, identical in all
+    /// SDKs); `Some(Duration::ZERO)` disables polling.
     pub poll_interval: Option<Duration>,
 }
 
+const STRIPES: usize = 32;
+const SAMPLE_MASK: u64 = 255;
+
+#[repr(align(64))]
+#[derive(Default)]
+struct Stripe(AtomicU64);
+
 /// A read-only memory-mapped view of a compiled `.attos` binary.
 ///
-/// Lookups are O(1) and zero-allocation. The struct is `Send + Sync`;
+/// Lookups are O(1), lock-free and zero-allocation. The struct is `Send + Sync`;
 /// concurrent reads from multiple threads are safe without locking.
 ///
 /// Memory is unmapped via `Drop`. When held inside an `Arc` (as used by
-/// `AttosClient`), the munmap is deferred until the last `Guard` reference
-/// from `ArcSwap::load()` is dropped, guaranteeing readers observe coherent
-/// data at all times.
-#[derive(Debug)]
+/// `AttosClient`), the munmap is deferred until the last `Guard`/`Arc`
+/// reference is dropped, so a lookup in progress always completes against the
+/// map it loaded. Zero-copy values (`&[u8]` / `&str`) borrow the map (or the
+/// guard holding it) and cannot outlive it — the validity window is enforced
+/// by the borrow checker.
 pub struct AttosMap {
     mmap: Mmap,
     pub version: u32,
     is_32bit: bool,
+    /// Number of slots (S).
     pub total_keys: u64,
     num_buckets: u64,
-    #[allow(dead_code)]
-    global_seed: u64,
-
     routing_offset: usize,
     values_offset: usize,
     blob_offset: usize,
+    data_end: usize,
     pinned: bool,
+    closed: bool,
+    // Telemetry: striped lookup counters (indexed by key hash, so concurrent
+    // readers rarely share a cache line) and a 1/256-sampled latency histogram.
+    lookups: [Stripe; STRIPES],
+    pub(crate) latency: LatencyHistogram,
+}
+
+impl std::fmt::Debug for AttosMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttosMap")
+            .field("version", &self.version)
+            .field("is_32bit", &self.is_32bit)
+            .field("total_keys", &self.total_keys)
+            .field("num_buckets", &self.num_buckets)
+            .field("size", &self.mmap.len())
+            .field("pinned", &self.pinned)
+            .field("closed", &self.closed)
+            .finish()
+    }
+}
+
+/// Parsed and validated header layout.
+pub(crate) struct Layout {
+    is_32bit: bool,
+    slots: u64,
+    buckets: u64,
+    routing_offset: usize,
+    values_offset: usize,
+    blob_offset: usize,
+    data_end: usize,
+}
+
+/// Validate a complete v1 blob (CONTRACTS.md §1.1 / §1.6).
+pub(crate) fn parse_layout(data: &[u8], check_crc: bool) -> Result<Layout, AttosError> {
+    let sz = data.len() as u64;
+    if sz < 4 {
+        return Err(AttosError::CorruptedBinary(format!("file too small ({} bytes)", sz)));
+    }
+    if &data[0..4] != MAGIC_ATTO {
+        return Err(AttosError::InvalidMagic);
+    }
+    if sz < 8 {
+        return Err(AttosError::CorruptedBinary("file too small for version".into()));
+    }
+    let version = u32::from_be_bytes(data[4..8].try_into().unwrap());
+    if version != 1 {
+        return Err(AttosError::InvalidVersion(version));
+    }
+    if sz < HEADER_SIZE as u64 {
+        return Err(AttosError::CorruptedBinary(format!("file too small for header ({} bytes)", sz)));
+    }
+    let w: u64 = match data[8] {
+        0x01 => 2,
+        0x02 => 4,
+        f => return Err(AttosError::CorruptedBinary(format!("invalid routing flag 0x{:02x}", f))),
+    };
+    let slots = u64::from_be_bytes(data[9..17].try_into().unwrap());
+    let buckets = u64::from_be_bytes(data[17..25].try_into().unwrap());
+    if slots == 0 || buckets == 0 {
+        return Err(AttosError::CorruptedBinary("zero slots or buckets".into()));
+    }
+    let r = buckets
+        .checked_mul(w)
+        .and_then(|v| v.checked_add(HEADER_SIZE as u64));
+    let d = r.and_then(|r| slots.checked_mul(8).and_then(|v| v.checked_add(r)));
+    let d = match d {
+        Some(d) if d.checked_add(4).map_or(false, |e| e <= sz) => d,
+        _ => {
+            return Err(AttosError::CorruptedBinary(format!(
+                "header counts (S={}, B={}) exceed file size {}",
+                slots, buckets, sz
+            )))
+        }
+    };
+    let r = r.unwrap();
+    if check_crc {
+        let end = data.len() - 4;
+        let mut hasher = Crc32Hasher::new();
+        hasher.update(&data[..end]);
+        let actual = hasher.finalize();
+        let expected = u32::from_be_bytes(data[end..].try_into().unwrap());
+        if expected != actual {
+            return Err(AttosError::ChecksumMismatch { expected, actual });
+        }
+    }
+    Ok(Layout {
+        is_32bit: w == 4,
+        slots,
+        buckets,
+        routing_offset: HEADER_SIZE,
+        values_offset: r as usize,
+        blob_offset: d as usize,
+        data_end: data.len() - 4,
+    })
+}
+
+#[inline(always)]
+fn hash_key(key: &[u8]) -> u64 {
+    let mut hasher = XxHash64::with_seed(0);
+    hasher.write(key);
+    hasher.finish()
+}
+
+#[inline(always)]
+fn read_u16(b: &[u8], off: usize) -> u16 {
+    u16::from_be_bytes([b[off], b[off + 1]])
+}
+#[inline(always)]
+fn read_u32(b: &[u8], off: usize) -> u32 {
+    u32::from_be_bytes(b[off..off + 4].try_into().unwrap())
+}
+#[inline(always)]
+fn read_u64(b: &[u8], off: usize) -> u64 {
+    u64::from_be_bytes(b[off..off + 8].try_into().unwrap())
 }
 
 impl AttosMap {
-    /// Open with default config (no checksum, no mlock, no polling).
+    /// Open with default config (no checksum, no mlock).
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, AttosError> {
         Self::open_with_config(path, OpenConfig::default())
     }
 
     /// Open with explicit configuration.
     ///
-    /// Returns a typed `AttosError` on every known failure mode. Callers should
-    /// match on the error variant rather than converting to a string.
+    /// Returns a typed `AttosError` on every known failure mode:
+    /// `InvalidMagic`, `InvalidVersion(v)`, `CorruptedBinary`, `ChecksumMismatch`.
     #[instrument(skip(path), fields(path = %path.as_ref().display()))]
     pub fn open_with_config<P: AsRef<Path>>(path: P, config: OpenConfig) -> Result<Self, AttosError> {
+        Self::open_inner(path.as_ref(), config, config.validate_checksum)
+    }
+
+    /// Fully validate a blob on disk (magic, version, flag, size arithmetic and
+    /// CRC32) — the validation the sync path applies before publishing.
+    pub fn validate_file<P: AsRef<Path>>(path: P) -> Result<(), AttosError> {
+        Self::open_inner(path.as_ref(), OpenConfig::default(), true).map(|_| ())
+    }
+
+    pub(crate) fn open_inner(path: &Path, config: OpenConfig, check_crc: bool) -> Result<Self, AttosError> {
         debug!("Opening AttosMap file");
-        let file = File::open(&path).map_err(AttosError::IoError)?;
-
-        let mmap_opts = MmapOptions::new();
-        let mmap = unsafe { mmap_opts.map(&file).map_err(AttosError::IoError)? };
-
-        if mmap.len() < 33 {
-            error!("File too small for header: {} bytes", mmap.len());
-            return Err(AttosError::CorruptedBinary("file too small for header".into()));
+        let file = File::open(path).map_err(AttosError::IoError)?;
+        let len = file.metadata().map_err(AttosError::IoError)?.len();
+        if len < 4 {
+            return Err(AttosError::CorruptedBinary(format!("file too small ({} bytes)", len)));
         }
-
-        if &mmap[0..4] != MAGIC_ATTO {
-            return Err(AttosError::InvalidMagic);
-        }
-
-        let version = u32::from_be_bytes(mmap[4..8].try_into().unwrap());
-        if version != 1 {
-            return Err(AttosError::InvalidVersion(version));
-        }
-
-        let flag = mmap[8];
-        let is_32bit = flag == 0x02;
-        let total_keys = u64::from_be_bytes(mmap[9..17].try_into().unwrap());
-        let num_buckets = u64::from_be_bytes(mmap[17..25].try_into().unwrap());
-        let global_seed = u64::from_be_bytes(mmap[25..33].try_into().unwrap());
-
-        let routing_offset = 33;
-        let routing_byte_size = if is_32bit {
-            (num_buckets * 4) as usize
-        } else {
-            (num_buckets * 2) as usize
-        };
-
-        let values_offset = routing_offset + routing_byte_size;
-        let blob_offset = values_offset + (total_keys as usize * 8);
-
-        if mmap.len() < blob_offset {
-            return Err(AttosError::CorruptedBinary("file too small for offsets".into()));
-        }
-
-        if config.validate_checksum {
-            if mmap.len() >= 4 {
-                let crc_offset = mmap.len() - 4;
-                let mut hasher = Crc32Hasher::new();
-                hasher.update(&mmap[..crc_offset]);
-                let expected = hasher.finalize();
-                let actual = u32::from_be_bytes(mmap[crc_offset..].try_into().unwrap());
-                if expected != actual {
-                    return Err(AttosError::ChecksumMismatch { expected, actual });
-                }
-            } else {
-                return Err(AttosError::CorruptedBinary("file too small for checksum".into()));
-            }
-        }
+        // SAFETY: memmap2 requires that the file is not modified or truncated
+        // while mapped. The SDK only maps files it owns: the synchronizer writes
+        // a new blob to a fresh temp file and atomically renames it over the
+        // live path, so a mapped inode is never written again; callers of
+        // `open` must likewise treat blobs as immutable (documented contract).
+        // The mapping is read-only (PROT_READ) and `file` may be closed after
+        // mapping without invalidating it.
+        let mmap = unsafe { MmapOptions::new().map(&file).map_err(AttosError::IoError)? };
+        drop(file);
+        let layout = parse_layout(&mmap, check_crc)?;
 
         let mut pinned = false;
         if config.pin_to_memory {
             #[cfg(unix)]
             {
-                let ptr = mmap.as_ptr() as *const libc::c_void;
-                let len = mmap.len();
-                unsafe {
-                    if libc::mlock(ptr, len) != 0 {
-                        return Err(AttosError::MlockFailed(std::io::Error::last_os_error()));
-                    }
+                // SAFETY: the pointer/length describe the live mapping owned by
+                // `mmap`; mlock does not access the memory.
+                let rc = unsafe { libc::mlock(mmap.as_ptr() as *const libc::c_void, mmap.len()) };
+                if rc != 0 {
+                    warn!(
+                        "mlock failed (non-fatal): {}",
+                        std::io::Error::last_os_error()
+                    );
+                } else {
+                    pinned = true;
                 }
-                pinned = true;
             }
         }
 
         // Advise the kernel that access patterns are random (not sequential).
-        // This suppresses read-ahead and reduces OS cache pressure.
         #[cfg(unix)]
         {
-            let ptr = mmap.as_ptr() as *mut libc::c_void;
-            let len = mmap.len();
-            unsafe {
-                libc::madvise(ptr, len, libc::MADV_RANDOM);
-            }
+            let _ = mmap.advise(memmap2::Advice::Random);
         }
 
         info!(
-            version, is_32bit, total_keys, num_buckets, pinned,
+            is_32bit = layout.is_32bit,
+            slots = layout.slots,
+            buckets = layout.buckets,
+            pinned,
             "Successfully opened AttosMap"
         );
 
         Ok(Self {
             mmap,
-            version,
-            is_32bit,
-            total_keys,
-            num_buckets,
-            global_seed,
-            routing_offset,
-            values_offset,
-            blob_offset,
+            version: 1,
+            is_32bit: layout.is_32bit,
+            total_keys: layout.slots,
+            num_buckets: layout.buckets,
+            routing_offset: layout.routing_offset,
+            values_offset: layout.values_offset,
+            blob_offset: layout.blob_offset,
+            data_end: layout.data_end,
             pinned,
+            closed: false,
+            lookups: Default::default(),
+            latency: LatencyHistogram::default(),
         })
     }
 
-    /// Core MPHF routing: returns (blob_relative_offset, payload_length).
-    ///
-    /// A length of 0 means the slot is empty (MPHF padding). Callers must
-    /// additionally verify key bytes against the blob before accepting a hit.
-    #[inline(always)]
-    fn find_index(&self, key_hash: u64) -> (usize, usize) {
-        if self.num_buckets == 0 || self.total_keys == 0 {
-            return (0, 0);
+    /// A sentinel map installed by `AttosClient::shutdown`: every lookup
+    /// returns `AttosError::MapClosed`.
+    pub(crate) fn closed_sentinel() -> Self {
+        let anon = MmapOptions::new()
+            .len(HEADER_SIZE + 2 + 8 + 4)
+            .map_anon()
+            .and_then(|m| m.make_read_only())
+            .expect("anonymous mapping");
+        Self {
+            mmap: anon,
+            version: 1,
+            is_32bit: false,
+            total_keys: 1,
+            num_buckets: 1,
+            routing_offset: HEADER_SIZE,
+            values_offset: HEADER_SIZE + 2,
+            blob_offset: HEADER_SIZE + 10,
+            data_end: HEADER_SIZE + 10,
+            pinned: false,
+            closed: true,
+            lookups: Default::default(),
+            latency: LatencyHistogram::default(),
         }
+    }
 
-        let high = (key_hash >> 32) as u32;
-        let low = (key_hash & 0xFFFFFFFF) as u32;
+    /// True for the shutdown sentinel.
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
 
-        let segment_idx = (high as u64) % self.num_buckets;
-
-        let d = if self.is_32bit {
-            let disp_off = self.routing_offset + (segment_idx as usize * 4);
-            u32::from_be_bytes(self.mmap[disp_off..disp_off + 4].try_into().unwrap())
+    /// Size of the mapped blob in bytes.
+    pub fn size(&self) -> usize {
+        if self.closed {
+            0
         } else {
-            let disp_off = self.routing_offset + (segment_idx as usize * 2);
-            u16::from_be_bytes(self.mmap[disp_off..disp_off + 2].try_into().unwrap()) as u32
+            self.mmap.len()
+        }
+    }
+
+    /// Number of keys stored (O(S) scan of the offset table).
+    pub fn len(&self) -> usize {
+        if self.closed {
+            return 0;
+        }
+        (0..self.total_keys as usize)
+            .filter(|i| read_u64(&self.mmap, self.values_offset + i * 8) & 0xFFFF_FFFF != 0)
+            .count()
+    }
+
+    /// True if the map holds no keys.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Total lookups served by this map (telemetry).
+    pub fn lookups(&self) -> u64 {
+        self.lookups.iter().map(|s| s.0.load(Ordering::Relaxed)).sum()
+    }
+
+    #[inline(always)]
+    fn entry(&self, h: u64, key: &[u8]) -> Result<&[u8], AttosError> {
+        let data: &[u8] = &self.mmap;
+        let bucket = ((h >> 32) as u32 as u64) % self.num_buckets;
+        let d = if self.is_32bit {
+            read_u32(data, self.routing_offset + bucket as usize * 4) as u64
+        } else {
+            read_u16(data, self.routing_offset + bucket as usize * 2) as u64
         };
-
-        let final_index = ((low as u64) ^ (d as u64)) % self.total_keys;
-
-        let value_off = self.values_offset + (final_index as usize * 8);
-        let packed = u64::from_be_bytes(self.mmap[value_off..value_off + 8].try_into().unwrap());
-
-        let offset = (packed >> 32) as usize;
-        let length = (packed & 0xFFFFFFFF) as usize;
-
-        (offset, length)
+        let slot = ((h as u32 as u64) ^ d) % self.total_keys;
+        let word = read_u64(data, self.values_offset + slot as usize * 8);
+        let len = (word & 0xFFFF_FFFF) as usize;
+        if len == 0 {
+            return Err(if self.closed { AttosError::MapClosed } else { AttosError::KeyNotFound });
+        }
+        let start = self.blob_offset + (word >> 32) as usize;
+        let end = start + len;
+        if len < 2 || end > self.data_end {
+            return Err(AttosError::CorruptedBinary("entry out of bounds".into()));
+        }
+        let e = &data[start..end];
+        let kl = read_u16(e, 0) as usize;
+        if 2 + kl > len {
+            return Err(AttosError::CorruptedBinary("key length exceeds entry".into()));
+        }
+        if &e[2..2 + kl] != key {
+            return Err(AttosError::KeyNotFound);
+        }
+        Ok(&e[2 + kl..])
     }
 
     /// O(1) lookup by raw byte slice key.
     ///
-    /// Returns a zero-copy slice into the mmap region. The slice is valid
-    /// for the lifetime of this `AttosMap` (or the `Guard` holding it).
-    /// Allocation profile: **0 B/op**.
+    /// Returns a zero-copy slice into the mmap region, valid for the lifetime of
+    /// this `AttosMap` (or the `Guard` holding it). Use [`AttosMap::get_copy`] to
+    /// keep a value beyond that. Allocation profile: **0 B/op**.
     #[inline(always)]
     pub fn get<'a>(&'a self, key: &[u8]) -> Result<&'a [u8], AttosError> {
-        let mut hasher = XxHash64::with_seed(0);
-        hasher.write(key);
-        let key_hash = hasher.finish();
-
-        let (offset, length) = self.find_index(key_hash);
-
-        if length == 0 {
-            return Err(AttosError::KeyNotFound);
+        let h = hash_key(key);
+        let n = self.lookups[(h as usize) & (STRIPES - 1)]
+            .0
+            .fetch_add(1, Ordering::Relaxed);
+        if n & SAMPLE_MASK == 0 {
+            let t0 = Instant::now();
+            let r = self.entry(h, key);
+            self.latency.record(t0.elapsed());
+            return r;
         }
+        self.entry(h, key)
+    }
 
-        let start = self.blob_offset + offset;
-        let end = start + length;
-
-        if end > self.mmap.len() || start > end {
-            return Err(AttosError::CorruptedBinary("payload index out of bounds".into()));
-        }
-
-        let payload = &self.mmap[start..end];
-
-        if payload.len() < 2 {
-            return Err(AttosError::CorruptedBinary("payload too small for key length".into()));
-        }
-
-        let key_len = u16::from_be_bytes(payload[0..2].try_into().unwrap()) as usize;
-
-        if payload.len() < 2 + key_len {
-            return Err(AttosError::CorruptedBinary("payload too small for key".into()));
-        }
-
-        let key_bytes = &payload[2..2 + key_len];
-        if key_bytes != key {
-            return Err(AttosError::KeyNotFound);
-        }
-
-        Ok(&payload[2 + key_len..])
+    /// Copying lookup: appends the value to `dst` (no allocation if `dst` has
+    /// capacity). The result does not borrow the map.
+    #[inline]
+    pub fn get_copy(&self, key: &[u8], dst: &mut Vec<u8>) -> Result<(), AttosError> {
+        let v = self.get(key)?;
+        dst.extend_from_slice(v);
+        Ok(())
     }
 
     /// O(1) lookup returning a zero-copy `&str`.
@@ -260,9 +402,9 @@ impl AttosMap {
 
     /// Multi-dimensional O(1) lookup.
     ///
-    /// `factors` are dimension values sorted alphabetically by column name
-    /// (matching the builder's sort order). They are concatenated with a
-    /// `\x00` separator into a 1 KiB stack buffer — zero heap allocation.
+    /// `factors` are dimension values sorted by column name (matching the
+    /// builder's sort order). They are concatenated with a `\x00` separator
+    /// into a 1 KiB stack buffer — zero heap allocation.
     ///
     /// Returns `AttosError::KeyNotFound` if the composite key is absent or
     /// if the concatenated key exceeds 1 024 bytes.
@@ -297,31 +439,27 @@ impl AttosMap {
     where
         F: FnMut(&[u8], &[u8]) -> bool,
     {
-        for i in 0..self.total_keys {
-            let value_off = self.values_offset + (i as usize * 8);
-            let packed = u64::from_be_bytes(self.mmap[value_off..value_off + 8].try_into().unwrap());
-
-            let offset = (packed >> 32) as usize;
-            let length = (packed & 0xFFFFFFFF) as usize;
-
-            if length == 0 {
+        if self.closed {
+            return;
+        }
+        for i in 0..self.total_keys as usize {
+            let word = read_u64(&self.mmap, self.values_offset + i * 8);
+            let len = (word & 0xFFFF_FFFF) as usize;
+            if len == 0 {
                 continue;
             }
-
-            let start = self.blob_offset + offset;
-            let end = start + length;
-            if end <= self.mmap.len() && start <= end {
-                let payload = &self.mmap[start..end];
-                if payload.len() >= 2 {
-                    let key_len = u16::from_be_bytes(payload[0..2].try_into().unwrap()) as usize;
-                    if payload.len() >= 2 + key_len {
-                        let k = &payload[2..2 + key_len];
-                        let v = &payload[2 + key_len..];
-                        if !callback(k, v) {
-                            break;
-                        }
-                    }
-                }
+            let start = self.blob_offset + (word >> 32) as usize;
+            let end = start + len;
+            if len < 2 || end > self.data_end {
+                continue;
+            }
+            let e = &self.mmap[start..end];
+            let kl = read_u16(e, 0) as usize;
+            if 2 + kl > len {
+                continue;
+            }
+            if !callback(&e[2..2 + kl], &e[2 + kl..]) {
+                break;
             }
         }
     }
@@ -332,10 +470,11 @@ impl Drop for AttosMap {
         if self.pinned {
             #[cfg(unix)]
             {
-                let ptr = self.mmap.as_ptr() as *const libc::c_void;
-                let len = self.mmap.len();
+                // SAFETY: pointer/length describe the mapping still owned by
+                // `self.mmap` (dropped after this block); munlock does not
+                // dereference it.
                 unsafe {
-                    libc::munlock(ptr, len);
+                    libc::munlock(self.mmap.as_ptr() as *const libc::c_void, self.mmap.len());
                 }
             }
         }
@@ -343,7 +482,10 @@ impl Drop for AttosMap {
     }
 }
 
-// AttosMap is safe to share across threads: the mmap is read-only and all
-// fields are immutable after construction.
-unsafe impl Send for AttosMap {}
-unsafe impl Sync for AttosMap {}
+// `AttosMap` is `Send + Sync` automatically: `Mmap` is `Send + Sync` (the
+// mapping is read-only) and the telemetry counters are atomics.
+#[allow(dead_code)]
+fn _assert_send_sync() {
+    fn is<T: Send + Sync>() {}
+    is::<AttosMap>();
+}
