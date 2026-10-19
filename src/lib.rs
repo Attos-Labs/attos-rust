@@ -14,4 +14,4 @@ pub use sync::AttosClient;
 pub use synchronizer::{AttosSynchronizer, SyncConfig, SyncOutcome};
 
 /// SDK version reported in `User-Agent` and telemetry.
-pub const VERSION: &str = "1.1.0";
+pub const VERSION: &str = "1.2.0";
