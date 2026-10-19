@@ -16,3 +16,6 @@ Cargo.lock
 *.exp
 *.ilk
 *.rsp
+
+# Stray rustup state
+.rustup/
