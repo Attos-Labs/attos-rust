@@ -17,6 +17,8 @@ enum Resp {
     Truncated(Vec<u8>),
     Kill(Vec<u8>),
     Raw(Vec<u8>),
+    /// A body sent with Content-Encoding (e.g. gzip) and ETag.
+    Encoded(Vec<u8>, &'static str, &'static str),
 }
 
 #[derive(Default)]
@@ -96,6 +98,13 @@ fn handle(mut s: TcpStream, st: Arc<Mutex<State>>) {
             let _ = s.shutdown(std::net::Shutdown::Both);
         }
         Resp::Raw(b) => write_resp(&mut s, 200, &[("ETag".into(), "raw".into())], &b, None),
+        Resp::Encoded(b, enc, etag) => write_resp(
+            &mut s,
+            200,
+            &[("ETag".into(), etag.into()), ("Content-Encoding".into(), enc.into()), ("Vary".into(), "Accept-Encoding".into())],
+            &b,
+            None,
+        ),
     }
 }
 
@@ -363,6 +372,66 @@ fn telemetry_disabled_by_server() {
     s.flush_telemetry();
     std::thread::sleep(Duration::from_millis(100));
     assert!(f.st.lock().unwrap().telem.is_empty());
+    s.shutdown();
+}
+
+fn gz(b: &[u8]) -> Vec<u8> {
+    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    e.write_all(b).unwrap();
+    e.finish().unwrap()
+}
+
+#[test]
+fn gzip_sync_decompresses_and_validates() {
+    let a = blob("A", 200);
+    let f = fake(a.clone(), "\"a\"");
+    f.st.lock().unwrap().script.push_back(Resp::Encoded(gz(&a), "gzip", "\"a-gzip\""));
+    let dir = tempfile::tempdir().unwrap();
+    let s = AttosSynchronizer::start(cfg(&f, dir.path())).unwrap();
+    assert_eq!(value(&s, "key_9"), "A_9");
+    assert_eq!(f.st.lock().unwrap().sync_reqs[0].get("accept-encoding").map(String::as_str), Some("gzip"));
+    // The cached file is the raw v1 blob, not the gzip bytes.
+    assert_eq!(std::fs::read(dir.path().join("ds-1.attos")).unwrap(), a);
+    assert_eq!(std::fs::read_to_string(dir.path().join("ds-1.etag")).unwrap(), "\"a-gzip\"");
+
+    let b = blob("B", 200);
+    let wire = gz(&b);
+    let mut bad_crc = b.clone();
+    let n = bad_crc.len();
+    bad_crc[n - 6] ^= 0xFF;
+    let mut corrupt = wire.clone();
+    let m = corrupt.len();
+    corrupt[m / 2] ^= 0xFF;
+    let cases: Vec<(&str, Resp, fn(&AttosError) -> bool)> = vec![
+        // The HTTP body is complete (Content-Length matches) but the gzip
+        // stream stops halfway: only the gzip trailer check catches it.
+        ("cut gzip", Resp::Encoded(wire[..wire.len() / 2].to_vec(), "gzip", "\"t\""), |e| matches!(e, AttosError::Transport(_))),
+        ("corrupt gzip", Resp::Encoded(corrupt, "gzip", "\"c\""), |e| matches!(e, AttosError::Transport(_))),
+        ("bad blob crc", Resp::Encoded(gz(&bad_crc), "gzip", "\"x\""), |e| matches!(e, AttosError::ChecksumMismatch { .. })),
+        ("unknown coding", Resp::Encoded(b.clone(), "br", "\"y\""), |e| matches!(e, AttosError::Transport(_))),
+    ];
+    for (name, r, check) in cases {
+        f.st.lock().unwrap().script.push_back(r);
+        let e = s.sync_now().unwrap_err();
+        assert!(check(&e), "{}: unexpected {}", name, e);
+        assert_eq!(value(&s, "key_9"), "A_9", "{}", name);
+        assert_eq!(temps(dir.path()), 0, "{}: temp left", name);
+    }
+    f.st.lock().unwrap().script.push_back(Resp::Encoded(wire, "gzip", "\"b-gzip\""));
+    assert_eq!(s.sync_now().unwrap(), SyncOutcome::Updated);
+    assert_eq!(value(&s, "key_9"), "B_9");
+    s.shutdown();
+}
+
+#[test]
+fn compression_off_asks_for_identity() {
+    let f = fake(blob("A", 10), "\"a\"");
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = cfg(&f, dir.path());
+    c.compression = false;
+    let s = AttosSynchronizer::start(c).unwrap();
+    assert_eq!(value(&s, "key_1"), "A_1");
+    assert_eq!(f.st.lock().unwrap().sync_reqs[0].get("accept-encoding").map(String::as_str), Some("identity"));
     s.shutdown();
 }
 

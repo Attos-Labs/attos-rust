@@ -46,6 +46,9 @@ pub struct SyncConfig {
     /// nodes are counted by distinct ID, so processes or containers sharing a
     /// hostname count as one node unless they set their own ID.
     pub node_id: Option<String>,
+    /// Ask for the gzip copy of the blob (`Accept-Encoding: gzip`; default
+    /// true). Transport-only: the stored and mapped blob is always the v1 file.
+    pub compression: bool,
     /// Background poll interval; `Duration::ZERO` disables polling.
     pub poll_interval: Duration,
     pub open: OpenConfig,
@@ -68,6 +71,7 @@ impl SyncConfig {
             dataset_id: dataset_id.into(),
             cache_dir: PathBuf::from("./.attos/cache"),
             node_id: None,
+            compression: true,
             poll_interval: DEFAULT_SYNC_INTERVAL,
             open: OpenConfig::default(),
             telemetry_interval: DEFAULT_TELEMETRY_INTERVAL,
@@ -439,6 +443,31 @@ async fn run(
     }
 }
 
+/// Where a download is written: the temp file, or a gzip decoder in front of it.
+enum Sink {
+    Raw(fs::File),
+    Gzip(flate2::write::GzDecoder<fs::File>),
+}
+
+impl Sink {
+    fn write_all(&mut self, b: &[u8]) -> std::io::Result<()> {
+        match self {
+            Sink::Raw(f) => f.write_all(b),
+            Sink::Gzip(d) => d.write_all(b),
+        }
+    }
+
+    /// The temp file, once a gzip stream has ended with a valid trailer.
+    fn finish(self) -> Result<fs::File, AttosError> {
+        match self {
+            Sink::Raw(f) => Ok(f),
+            Sink::Gzip(d) => d
+                .finish()
+                .map_err(|e| AttosError::Transport(format!("truncated or corrupt gzip download: {}", e))),
+        }
+    }
+}
+
 /// One conditional GET; on 200 install the blob per the §4 swap invariant.
 async fn sync_once(
     inner: &Inner,
@@ -450,7 +479,8 @@ async fn sync_once(
         .get(&url)
         .header("X-API-Key", &inner.cfg.api_key)
         .header("X-Attos-Node-ID", &inner.node_id)
-        .header("User-Agent", format!("attos-rust/{}", crate::VERSION));
+        .header("User-Agent", format!("attos-rust/{}", crate::VERSION))
+        .header("Accept-Encoding", if inner.cfg.compression { "gzip" } else { "identity" });
     let etag = inner.etag.lock().unwrap().clone();
     if let (Some(e), Some(_)) = (&etag, client.as_ref()) {
         req = req.header("If-None-Match", e);
@@ -472,6 +502,11 @@ async fn sync_once(
     let cfg_hdr = resp.headers().get("x-attos-config").and_then(|v| v.to_str().ok()).map(String::from);
     let name = resp.headers().get("x-dataset-name").and_then(|v| v.to_str().ok()).map(String::from);
     let content_length = resp.content_length();
+    let gzip = match resp.headers().get("content-encoding").and_then(|v| v.to_str().ok()) {
+        None | Some("identity") => false,
+        Some("gzip") => true,
+        Some(other) => return Err(AttosError::Transport(format!("unsupported Content-Encoding {:?}", other))),
+    };
 
     // Download to a temp file in the same directory as the live blob.
     let tmp = inner
@@ -479,12 +514,18 @@ async fn sync_once(
         .cache_dir
         .join(format!("{}{:016x}", temp_prefix(inner), RandomState::new().build_hasher().finish()));
     let mut guard = TempGuard(Some(tmp.clone()));
-    let mut f = fs::File::create(&tmp)?;
+    // Compressed sync (CONTRACTS §4): a gzip body is decompressed while it is
+    // written. Content-Length counts wire bytes; an incomplete or corrupted
+    // gzip stream fails its trailer check, and the decompressed blob still
+    // gets the full v1 validation (CRC32) below.
+    let file = fs::File::create(&tmp)?;
+    let mut out = if gzip { Sink::Gzip(flate2::write::GzDecoder::new(file)) } else { Sink::Raw(file) };
     let mut written: u64 = 0;
     loop {
         match resp.chunk().await {
             Ok(Some(c)) => {
-                f.write_all(&c)?;
+                out.write_all(&c)
+                    .map_err(|e| AttosError::Transport(format!("corrupt download: {}", e)))?;
                 written += c.len() as u64;
             }
             Ok(None) => break,
@@ -496,6 +537,7 @@ async fn sync_once(
             return Err(AttosError::Transport(format!("truncated download: {} of {} bytes", written, cl)));
         }
     }
+    let f = out.finish()?;
     f.sync_all()?;
     drop(f);
     // Validate the complete file (magic, version, flag, sizes, CRC) before it
