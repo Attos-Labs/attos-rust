@@ -41,7 +41,10 @@ pub struct SyncConfig {
     pub dataset_id: String,
     /// Directory holding `<dataset_id>.attos`, its ETag and in-progress downloads.
     pub cache_dir: PathBuf,
-    /// `X-Attos-Node-ID` (1–128 chars). Default: a UUIDv4 generated at start.
+    /// `X-Attos-Node-ID` (1–128 chars). Default: the `ATTOS_NODE_ID`
+    /// environment variable, else the hostname, else a random UUIDv4. Active
+    /// nodes are counted by distinct ID, so processes or containers sharing a
+    /// hostname count as one node unless they set their own ID.
     pub node_id: Option<String>,
     /// Background poll interval; `Duration::ZERO` disables polling.
     pub poll_interval: Duration,
@@ -111,6 +114,36 @@ pub struct AttosSynchronizer {
 
 /// A random UUIDv4 without extra dependencies (std RandomState is seeded from
 /// the OS RNG).
+/// The default node ID: `ATTOS_NODE_ID`, else the hostname, else a random
+/// UUIDv4, cut to 128 characters. A process restarted on the same host keeps
+/// its ID, so a restart is one active node, not two.
+pub fn default_node_id() -> String {
+    node_id_from(std::env::var("ATTOS_NODE_ID").ok(), hostname())
+}
+
+fn node_id_from(env: Option<String>, host: Option<String>) -> String {
+    let pick = |v: Option<String>| v.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let id = pick(env).or_else(|| pick(host)).unwrap_or_else(uuid_v4);
+    id.chars().take(128).collect()
+}
+
+#[cfg(unix)]
+fn hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: buf is valid for buf.len() bytes; gethostname NUL-terminates
+    // on success when the name fits.
+    if unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0)?;
+    String::from_utf8(buf[..end].to_vec()).ok()
+}
+
+#[cfg(not(unix))]
+fn hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok()
+}
+
 pub fn uuid_v4() -> String {
     let mut b = [0u8; 16];
     for (i, chunk) in b.chunks_mut(8).enumerate() {
@@ -180,7 +213,7 @@ impl AttosSynchronizer {
     /// Load a cached blob (if valid), run the initial sync and start the
     /// background thread. Fails only if no data at all could be loaded.
     pub fn start(cfg: SyncConfig) -> Result<Self, AttosError> {
-        let node_id = cfg.node_id.clone().unwrap_or_else(uuid_v4);
+        let node_id = cfg.node_id.clone().unwrap_or_else(default_node_id);
         if node_id.is_empty() || node_id.len() > 128 {
             return Err(AttosError::Config(format!("node id must be 1-128 chars, got {}", node_id.len())));
         }
@@ -600,5 +633,19 @@ async fn deliver(inner: &Inner, http: &reqwest::Client, url: &str, key: &str, bo
                 attempt += 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod node_id_tests {
+    use super::node_id_from;
+
+    #[test]
+    fn precedence_and_limits() {
+        assert_eq!(node_id_from(Some(" pod-1 ".into()), Some("host".into())), "pod-1");
+        assert_eq!(node_id_from(None, Some("web-7.internal".into())), "web-7.internal");
+        assert_eq!(node_id_from(Some("  ".into()), Some("host".into())), "host");
+        assert_eq!(node_id_from(None, None).len(), 36);
+        assert_eq!(node_id_from(Some("x".repeat(300)), None).len(), 128);
     }
 }

@@ -365,3 +365,20 @@ fn telemetry_disabled_by_server() {
     assert!(f.st.lock().unwrap().telem.is_empty());
     s.shutdown();
 }
+
+#[test]
+fn default_node_id_is_env_or_hostname() {
+    let f = fake(blob("A", 10), "\"a\"");
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = cfg(&f, dir.path());
+    c.node_id = None;
+    let s = AttosSynchronizer::start(c).unwrap();
+    let id = s.node_id().to_string();
+    let want = std::env::var("ATTOS_NODE_ID").ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| {
+        let out = std::process::Command::new("hostname").output().unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    });
+    assert_eq!(id, want);
+    assert_eq!(f.st.lock().unwrap().sync_reqs[0].get("x-attos-node-id"), Some(&id));
+    s.shutdown();
+}
