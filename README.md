@@ -18,14 +18,14 @@ You need a recent stable Rust toolchain and a free Attos Cloud account.
 
 In the dashboard open **Datasets → Create dataset** and upload the file. When the status is `ready`, copy the dataset ID shown under the dataset name.
 
-**3. Create an API key** under **Settings → API Keys**. Copy it now: it is only shown once.
+**3. Create an API key** under **Settings → API Keys**. Copy it now: it is only shown once.  New keys start with `at_live_`; keys created earlier start with `nh_live_` and still work.
 
 **4. Look up a key.**
 
 ```bash
 cargo new attos-demo && cd attos-demo
 cargo add attos-client --git https://github.com/Attos-Labs/attos-rust
-export ATTOS_API_KEY="nh_live_..."
+export ATTOS_API_KEY="at_live_..."
 export ATTOS_DATASET_ID="<dataset id from step 2>"
 ```
 
