@@ -58,6 +58,23 @@ cargo run --release
 
 If it fails: `401` means the key is wrong, `404` means the dataset ID is wrong, and `409` means the dataset is still compiling, so retry in a few seconds.
 
+## Create datasets via the API
+
+You can also create a dataset without the dashboard. Upload a CSV or NDJSON file with your API key:
+
+```bash
+curl -X POST https://api.attoscloud.com/api/v1/datasets/compile \
+  -H "X-API-Key: $ATTOS_API_KEY" \
+  -F file=@sample.ndjson \
+  -F name=my-dataset
+```
+
+The response is `201` with the dataset `id` (use it as `ATTOS_DATASET_ID`), `row_count`, `blob_size` and `status`. `name` is optional and defaults to the file name. Instead of a multipart upload you can send the NDJSON as the request body and set the name with an `X-Dataset-Name` header.
+
+Compression is off by default. To turn on LZ4, add `-F compression=lz4` and optionally `-F block_size=<records>` (for a raw body, use the `X-Attos-Compression` and `X-Attos-Block-Size` headers). With LZ4, each lookup decompresses one block, which costs roughly 0.4 µs per record in the block and allocates. There is no setting for the input format or the blob format version. To replace the data of an existing dataset, `PUT /api/v1/datasets/{id}/data` with the same API key.
+
+Listing and deleting datasets and creating API keys need a dashboard login and are not available with an API key.
+
 ## Local files
 
 You can also map a `.attos` file directly, with no cloud involved:
