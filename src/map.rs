@@ -1,4 +1,5 @@
 use memmap2::{Mmap, MmapOptions};
+use std::borrow::Cow;
 use std::fs::File;
 use std::hash::Hasher;
 use std::path::Path;
@@ -11,6 +12,8 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::error::AttosError;
 use crate::stats::LatencyHistogram;
+use crate::v2::{lz4_decompress, next_record, uvarint, get_bits, V2Params, MAX_BLOCK_RAW};
+pub use crate::v2::{pthash_hp, pthash_mix, pthash_reduce};
 
 const MAGIC_ATTO: &[u8; 4] = b"ATTO";
 /// Fixed v1 header length (CONTRACTS.md §1.1).
@@ -68,6 +71,7 @@ pub struct AttosMap {
     data_end: usize,
     pinned: bool,
     closed: bool,
+    v2: Option<V2Params>,
     // Telemetry: striped lookup counters (indexed by key hash, so concurrent
     // readers rarely share a cache line) and a 1/256-sampled latency histogram.
     lookups: [Stripe; STRIPES],
@@ -163,6 +167,22 @@ pub(crate) fn parse_layout(data: &[u8], check_crc: bool) -> Result<Layout, Attos
     })
 }
 
+/// Validate a complete v2 blob: header/section arithmetic plus the optional CRC32 trailer.
+fn parse_v2(data: &[u8], check_crc: bool) -> Result<V2Params, AttosError> {
+    let p = V2Params::parse(data)?;
+    if check_crc {
+        let end = data.len() - 4;
+        let mut hasher = Crc32Hasher::new();
+        hasher.update(&data[..end]);
+        let actual = hasher.finalize();
+        let expected = u32::from_be_bytes(data[end..].try_into().unwrap());
+        if expected != actual {
+            return Err(AttosError::ChecksumMismatch { expected, actual });
+        }
+    }
+    Ok(p)
+}
+
 #[inline(always)]
 fn hash_key(key: &[u8]) -> u64 {
     let mut hasher = XxHash64::with_seed(0);
@@ -220,7 +240,23 @@ impl AttosMap {
         // mapping without invalidating it.
         let mmap = unsafe { MmapOptions::new().map(&file).map_err(AttosError::IoError)? };
         drop(file);
-        let layout = parse_layout(&mmap, check_crc)?;
+        let v2 = if mmap.len() >= 8 && &mmap[0..4] == MAGIC_ATTO && mmap[4..8] == [0, 0, 0, 2] {
+            Some(parse_v2(&mmap, check_crc)?)
+        } else {
+            None
+        };
+        let layout = match &v2 {
+            Some(p) => Layout {
+                is_32bit: false,
+                slots: p.n,
+                buckets: p.nb,
+                routing_offset: p.front_off,
+                values_offset: p.offsets_off,
+                blob_offset: p.blob_off,
+                data_end: mmap.len() - 4,
+            },
+            None => parse_layout(&mmap, check_crc)?,
+        };
 
         let mut pinned = false;
         if config.pin_to_memory {
@@ -256,7 +292,7 @@ impl AttosMap {
 
         Ok(Self {
             mmap,
-            version: 1,
+            version: if v2.is_some() { 2 } else { 1 },
             is_32bit: layout.is_32bit,
             total_keys: layout.slots,
             num_buckets: layout.buckets,
@@ -266,6 +302,7 @@ impl AttosMap {
             data_end: layout.data_end,
             pinned,
             closed: false,
+            v2,
             lookups: Default::default(),
             latency: LatencyHistogram::default(),
         })
@@ -291,6 +328,7 @@ impl AttosMap {
             data_end: HEADER_SIZE + 10,
             pinned: false,
             closed: true,
+            v2: None,
             lookups: Default::default(),
             latency: LatencyHistogram::default(),
         }
@@ -315,6 +353,9 @@ impl AttosMap {
         if self.closed {
             return 0;
         }
+        if self.v2.is_some() {
+            return self.total_keys as usize;
+        }
         (0..self.total_keys as usize)
             .filter(|i| read_u64(&self.mmap, self.values_offset + i * 8) & 0xFFFF_FFFF != 0)
             .count()
@@ -332,6 +373,14 @@ impl AttosMap {
 
     #[inline(always)]
     fn entry(&self, h: u64, key: &[u8]) -> Result<&[u8], AttosError> {
+        if let Some(p) = &self.v2 {
+            if p.compressed {
+                return Err(AttosError::CompressedRequiresOwned);
+            }
+            let slot = self.v2_slot(p, h)?;
+            let payload = self.v2_record(p, slot)?;
+            return Self::split_record(payload, key);
+        }
         let data: &[u8] = &self.mmap;
         let bucket = ((h >> 32) as u32 as u64) % self.num_buckets;
         let d = if self.is_32bit {
@@ -411,22 +460,7 @@ impl AttosMap {
     #[inline(always)]
     pub fn multi_lookup<'a>(&'a self, factors: &[&[u8]]) -> Result<&'a [u8], AttosError> {
         let mut buf = [0u8; 1024];
-        let mut offset = 0;
-        for (i, factor) in factors.iter().enumerate() {
-            if i > 0 {
-                if offset >= buf.len() {
-                    return Err(AttosError::KeyNotFound);
-                }
-                buf[offset] = 0x00;
-                offset += 1;
-            }
-            let end = offset + factor.len();
-            if end > buf.len() {
-                return Err(AttosError::KeyNotFound);
-            }
-            buf[offset..end].copy_from_slice(factor);
-            offset = end;
-        }
+        let offset = Self::fill_composite(&mut buf, factors)?;
         self.get(&buf[..offset])
     }
 
@@ -440,6 +474,10 @@ impl AttosMap {
         F: FnMut(&[u8], &[u8]) -> bool,
     {
         if self.closed {
+            return;
+        }
+        if let Some(p) = &self.v2 {
+            self.scan_v2(p, &mut callback);
             return;
         }
         for i in 0..self.total_keys as usize {
@@ -460,6 +498,221 @@ impl AttosMap {
             }
             if !callback(&e[2..2 + kl], &e[2 + kl..]) {
                 break;
+            }
+        }
+    }
+}
+
+impl AttosMap {
+    /// PTHash slot for key hash `x`, in `[0, n)`. Never panics on hostile data.
+    #[inline(always)]
+    fn v2_slot(&self, p: &V2Params, x: u64) -> Result<u64, AttosError> {
+        let corrupt = || AttosError::CorruptedBinary("v2 table out of bounds".into());
+        let r = x.rotate_left(32);
+        let pilot = if x < p.p1thr {
+            let sec = self.mmap.get(p.front_off..p.back_off).ok_or_else(corrupt)?;
+            get_bits(sec, pthash_reduce(r, p.p2), p.fw)
+        } else {
+            let sec = self.mmap.get(p.back_off..p.free_off).ok_or_else(corrupt)?;
+            get_bits(sec, pthash_reduce(r, p.nb - p.p2), p.bw)
+        }
+        .ok_or_else(corrupt)?;
+        let mut q = pthash_reduce(pthash_mix(x ^ pthash_hp(pilot)), p.m);
+        if q >= p.n {
+            let o = p.free_off + (q - p.n) as usize * 4;
+            let b = self.mmap.get(o..o + 4).ok_or_else(corrupt)?;
+            q = u32::from_le_bytes(b.try_into().unwrap()) as u64;
+        }
+        if q >= p.n {
+            return Err(corrupt());
+        }
+        Ok(q)
+    }
+
+    /// Returns the record bytes (`u16 keyLen | key | value`) of slot `slot`.
+    #[inline(always)]
+    fn v2_record(&self, p: &V2Params, slot: u64) -> Result<&[u8], AttosError> {
+        let corrupt = || AttosError::CorruptedBinary("payload index out of bounds".into());
+        let o = p.offsets_off + slot as usize * 4;
+        let b = self.mmap.get(o..o + 8).ok_or_else(corrupt)?;
+        let start = u32::from_le_bytes(b[0..4].try_into().unwrap()) as usize;
+        let end = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
+        if start > end || end > p.blob_len {
+            return Err(corrupt());
+        }
+        self.mmap.get(p.blob_off + start..p.blob_off + end).ok_or_else(corrupt)
+    }
+
+    /// Splits a record and returns its value if the stored key equals `key`.
+    #[inline(always)]
+    fn split_record<'a>(payload: &'a [u8], key: &[u8]) -> Result<&'a [u8], AttosError> {
+        if payload.len() < 2 {
+            return Err(AttosError::CorruptedBinary("payload too small for key length".into()));
+        }
+        let key_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+        let key_bytes = payload
+            .get(2..2 + key_len)
+            .ok_or_else(|| AttosError::CorruptedBinary("payload too small for key".into()))?;
+        if key_bytes != key {
+            return Err(AttosError::KeyNotFound);
+        }
+        Ok(&payload[2 + key_len..])
+    }
+
+    /// Whether the file stores records in (optionally LZ4-compressed) blocks (v2 flags bit 0).
+    /// For such files `get` / `get_string` / `multi_lookup` return
+    /// `AttosError::CompressedRequiresOwned`; use `get_cow`, `get_owned` and friends.
+    pub fn is_compressed(&self) -> bool {
+        self.v2.map(|p| p.compressed).unwrap_or(false)
+    }
+
+    /// Returns the (blob-relative checked) bytes of block `b`, method byte included.
+    fn v2_block(&self, p: &V2Params, b: u64) -> Result<&[u8], AttosError> {
+        let corrupt = || AttosError::CorruptedBinary("block index out of bounds".into());
+        let o = p.offsets_off.checked_add((b as usize).checked_mul(4).ok_or_else(corrupt)?).ok_or_else(corrupt)?;
+        let w = self.mmap.get(o..o + 8).ok_or_else(corrupt)?;
+        let start = u32::from_le_bytes(w[0..4].try_into().unwrap()) as usize;
+        let end = u32::from_le_bytes(w[4..8].try_into().unwrap()) as usize;
+        if end <= start || end > p.blob_len {
+            return Err(corrupt());
+        }
+        self.mmap.get(p.blob_off + start..p.blob_off + end).ok_or_else(corrupt)
+    }
+
+    /// Decodes a block into `uvarint(len) | record` sequences. Stored blocks borrow the mapping.
+    fn decode_block(blk: &[u8]) -> Result<Cow<'_, [u8]>, AttosError> {
+        let corrupt = || AttosError::CorruptedBinary("invalid compressed block".into());
+        let (raw_len, n) = uvarint(blk.get(1..).ok_or_else(corrupt)?).ok_or_else(corrupt)?;
+        if raw_len > MAX_BLOCK_RAW {
+            return Err(corrupt());
+        }
+        let payload = &blk[1 + n..];
+        match blk[0] {
+            0 => {
+                if payload.len() as u64 != raw_len {
+                    return Err(corrupt());
+                }
+                Ok(Cow::Borrowed(payload))
+            }
+            1 => {
+                if raw_len > (payload.len() as u64) * 255 + 16 {
+                    return Err(corrupt());
+                }
+                let mut raw = vec![0u8; raw_len as usize];
+                lz4_decompress(&mut raw, payload).map_err(|_| corrupt())?;
+                Ok(Cow::Owned(raw))
+            }
+            _ => Err(corrupt()),
+        }
+    }
+
+    /// Lookup that works for every file kind. Plain files return a borrowed view of the mapping;
+    /// compressed files return a stored-block view or a copy (LZ4 blocks must be decoded).
+    pub fn get_cow<'a>(&'a self, key: &[u8]) -> Result<Cow<'a, [u8]>, AttosError> {
+        let p = match &self.v2 {
+            Some(p) if p.compressed => p,
+            _ => return self.get(key).map(Cow::Borrowed),
+        };
+        let h = hash_key(key);
+        self.lookups[(h as usize) & (STRIPES - 1)].0.fetch_add(1, Ordering::Relaxed);
+        let slot = self.v2_slot(p, h)?;
+        let blk = self.v2_block(p, slot >> p.block_shift)?;
+        let raw = Self::decode_block(blk)?;
+        let corrupt = || AttosError::CorruptedBinary("bad record in block".into());
+        let mut pos = 0usize;
+        let mut rec = (0, 0);
+        for _ in 0..=(slot & ((1u64 << p.block_shift) - 1)) {
+            let (s, e) = next_record(&raw, pos).ok_or_else(corrupt)?;
+            rec = (s, e);
+            pos = e;
+        }
+        let value_range = {
+            let r = &raw[rec.0..rec.1];
+            let v = Self::split_record(r, key)?;
+            let off = rec.1 - v.len();
+            off..rec.1
+        };
+        Ok(match raw {
+            Cow::Borrowed(b) => Cow::Borrowed(&b[value_range]),
+            Cow::Owned(v) => Cow::Owned(v[value_range].to_vec()),
+        })
+    }
+
+    /// Lookup returning an owned copy of the value; works for every file kind.
+    pub fn get_owned(&self, key: &[u8]) -> Result<Vec<u8>, AttosError> {
+        self.get_cow(key).map(Cow::into_owned)
+    }
+
+    /// Like `get_string` but works for compressed files (returns a `String`).
+    pub fn get_string_owned(&self, key: &str) -> Result<String, AttosError> {
+        String::from_utf8(self.get_owned(key.as_bytes())?)
+            .map_err(|e| e.utf8_error().into())
+    }
+
+    /// Like `multi_lookup` but works for every file kind.
+    pub fn multi_lookup_cow<'a>(&'a self, factors: &[&[u8]]) -> Result<Cow<'a, [u8]>, AttosError> {
+        let mut buf = [0u8; 1024];
+        let len = Self::fill_composite(&mut buf, factors)?;
+        self.get_cow(&buf[..len])
+    }
+
+    fn fill_composite(buf: &mut [u8; 1024], factors: &[&[u8]]) -> Result<usize, AttosError> {
+        let mut offset = 0;
+        for (i, factor) in factors.iter().enumerate() {
+            if i > 0 {
+                if offset >= buf.len() {
+                    return Err(AttosError::KeyNotFound);
+                }
+                buf[offset] = 0x00;
+                offset += 1;
+            }
+            let end = offset + factor.len();
+            if end > buf.len() {
+                return Err(AttosError::KeyNotFound);
+            }
+            buf[offset..end].copy_from_slice(factor);
+            offset = end;
+        }
+        Ok(offset)
+    }
+
+    fn scan_compressed<F: FnMut(&[u8], &[u8]) -> bool>(&self, p: &V2Params, callback: &mut F) {
+        let per = 1u64 << p.block_shift;
+        for b in 0..p.n.div_ceil(per) {
+            let Ok(blk) = self.v2_block(p, b) else { return };
+            let Ok(raw) = Self::decode_block(blk) else { return };
+            let count = per.min(p.n - b * per);
+            let mut pos = 0usize;
+            for _ in 0..count {
+                let Some((s, e)) = next_record(&raw, pos) else { return };
+                pos = e;
+                let rec = &raw[s..e];
+                if rec.len() < 2 {
+                    return;
+                }
+                let kl = u16::from_be_bytes([rec[0], rec[1]]) as usize;
+                let Some(k) = rec.get(2..2 + kl) else { return };
+                if !callback(k, &rec[2 + kl..]) {
+                    return;
+                }
+            }
+        }
+    }
+
+    fn scan_v2<F: FnMut(&[u8], &[u8]) -> bool>(&self, p: &V2Params, callback: &mut F) {
+        if p.compressed {
+            return self.scan_compressed(p, callback);
+        }
+        for i in 0..p.n {
+            if let Ok(payload) = self.v2_record(p, i) {
+                if payload.len() >= 2 {
+                    let key_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+                    if let Some(k) = payload.get(2..2 + key_len) {
+                        if !callback(k, &payload[2 + key_len..]) {
+                            break;
+                        }
+                    }
+                }
             }
         }
     }

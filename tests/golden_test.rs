@@ -76,7 +76,8 @@ fn golden_negative_fixtures() {
     let exp = dir.join("expected");
     let open = |f: &str| AttosMap::open_with_config(exp.join(f), cfg).map(|_| ());
     assert!(matches!(open("bad_magic.attos"), Err(AttosError::InvalidMagic)));
-    assert!(matches!(open("bad_version.attos"), Err(AttosError::InvalidVersion(2))));
+    // The fixture is a v1 body under version 2; v2 is a real format now, so it is a malformed v2 file.
+    assert!(matches!(open("bad_version.attos"), Err(AttosError::CorruptedBinary(_))));
     assert!(matches!(open("bad_crc.attos"), Err(AttosError::ChecksumMismatch { .. })));
     assert!(matches!(open("bad_flag.attos"), Err(AttosError::CorruptedBinary(_))));
     assert!(matches!(open("truncated.attos"), Err(AttosError::CorruptedBinary(_))));

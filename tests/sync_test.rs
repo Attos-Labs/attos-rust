@@ -193,12 +193,12 @@ fn fault_injection_keeps_serving_and_recovers() {
     let n = bad_crc.len();
     bad_crc[n - 6] ^= 0xFF;
     let mut bad_ver = next.clone();
-    bad_ver[7] = 2;
+    bad_ver[7] = 3;
     let cases: Vec<(&str, Resp, fn(&AttosError) -> bool)> = vec![
         ("truncated", Resp::Truncated(next.clone()), |e| matches!(e, AttosError::Transport(_))),
         ("killed", Resp::Kill(next.clone()), |e| matches!(e, AttosError::Transport(_))),
         ("bad-crc", Resp::Raw(bad_crc), |e| matches!(e, AttosError::ChecksumMismatch { .. })),
-        ("bad-version", Resp::Raw(bad_ver), |e| matches!(e, AttosError::InvalidVersion(2))),
+        ("bad-version", Resp::Raw(bad_ver), |e| matches!(e, AttosError::InvalidVersion(3))),
         ("garbage", Resp::Raw(b"<html>oops</html>".to_vec()), |e| matches!(e, AttosError::InvalidMagic)),
         ("402", Resp::Status(402, vec![]), |e| e.is_quota()),
         ("429", Resp::Status(429, vec![("Retry-After".into(), "7".into())]),

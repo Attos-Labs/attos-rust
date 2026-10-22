@@ -5,6 +5,7 @@ pub mod map;
 mod stats;
 pub mod sync;
 pub mod synchronizer;
+mod v2;
 pub mod telemetry;
 
 pub use error::AttosError;

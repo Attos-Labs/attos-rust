@@ -10,6 +10,8 @@ pub enum AttosError {
     InvalidVersion(u32),
     ChecksumMismatch { expected: u32, actual: u32 },
     MapClosed,
+    /// The file stores compressed blocks; use `get_cow` / `get_owned` instead of the zero-copy API.
+    CompressedRequiresOwned,
     MlockFailed(io::Error),
     IoError(io::Error),
     Utf8Error(std::str::Utf8Error),
@@ -40,6 +42,9 @@ impl fmt::Display for AttosError {
                 write!(f, "checksum mismatch: trailer {:#010x}, computed {:#010x}", expected, actual)
             }
             AttosError::MapClosed => write!(f, "map closed"),
+            AttosError::CompressedRequiresOwned => {
+                write!(f, "file uses compressed blocks: use get_cow/get_owned")
+            }
             AttosError::MlockFailed(e) => write!(f, "mlock failed: {}", e),
             AttosError::IoError(e) => write!(f, "io error: {}", e),
             AttosError::Utf8Error(e) => write!(f, "utf-8 error: {}", e),
