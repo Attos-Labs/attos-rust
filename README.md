@@ -69,9 +69,9 @@ curl -X POST https://api.attoscloud.com/api/v1/datasets/compile \
   -F name=my-dataset
 ```
 
-The response is `201` with the dataset `id` (use it as `ATTOS_DATASET_ID`), `row_count`, `blob_size` and `status`. `name` is optional and defaults to the file name. Instead of a multipart upload you can send the NDJSON as the request body and set the name with an `X-Dataset-Name` header.
+The input must have an `attos_value` column; every other column is a key dimension. The response is `201` with `id` (use it as `ATTOS_DATASET_ID`), `name`, `row_count`, `blob_size`, `compression`, `compression_note` and `status`. `name` is optional and defaults to the file name without its extension. Instead of a multipart upload you can send the NDJSON as the request body and set the name with an `X-Dataset-Name` header.
 
-Compression is off by default. To turn on LZ4, add `-F compression=lz4` and optionally `-F block_size=<records>` (for a raw body, use the `X-Attos-Compression` and `X-Attos-Block-Size` headers). With LZ4, each lookup decompresses one block, which costs roughly 0.4 µs per record in the block and allocates. There is no setting for the input format or the blob format version. To replace the data of an existing dataset, `PUT /api/v1/datasets/{id}/data` with the same API key.
+Compression is off by default. To turn on LZ4, add `-F compression=lz4` and optionally `-F block_size=<records>` (for a raw body, use the `X-Attos-Compression` and `X-Attos-Block-Size` headers). With LZ4, each lookup decompresses one block, which costs roughly 0.4 µs per record in the block and allocates. There is no setting for the input format or the blob format version. To replace the data of an existing dataset, `PUT /api/v1/datasets/{id}/data` with the same API key; it counts against your plan's monthly update limit.
 
 Listing and deleting datasets and creating API keys need a dashboard login and are not available with an API key.
 
