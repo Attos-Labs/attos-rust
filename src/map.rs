@@ -240,6 +240,11 @@ impl AttosMap {
         // mapping without invalidating it.
         let mmap = unsafe { MmapOptions::new().map(&file).map_err(AttosError::IoError)? };
         drop(file);
+        // The CRC pass (if requested) streams the whole mapping once.
+        #[cfg(unix)]
+        if check_crc {
+            let _ = mmap.advise(memmap2::Advice::Sequential);
+        }
         let v2 = if mmap.len() >= 8 && &mmap[0..4] == MAGIC_ATTO && mmap[4..8] == [0, 0, 0, 2] {
             Some(parse_v2(&mmap, check_crc)?)
         } else {
@@ -257,6 +262,18 @@ impl AttosMap {
             },
             None => parse_layout(&mmap, check_crc)?,
         };
+
+        // Serving RSS: a validation pass faulted every page into this process.
+        // Drop them from the process (page cache keeps them) so a validated map
+        // does not count the whole file as resident. Skipped when pinning, as
+        // mlock'd pages cannot be released and the caller asked for residency.
+        #[cfg(target_os = "linux")]
+        if check_crc && !config.pin_to_memory {
+            // SAFETY: read-only file-backed mapping; MADV_DONTNEED only drops
+            // the process's page-table entries and later accesses refault
+            // identical contents from the file.
+            let _ = unsafe { mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
+        }
 
         let mut pinned = false;
         if config.pin_to_memory {
