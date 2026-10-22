@@ -131,6 +131,25 @@ pub(crate) fn packed_size(count: u64, w: u64) -> Option<u64> {
     words.checked_mul(8)?.checked_add(8)
 }
 
+/// Size in bytes of the offsets section: `ceil(count*w/8)*8`, plus 8 bytes of slack when `w == 5`.
+pub(crate) fn offsets_size(count: u64, w: usize) -> Option<u64> {
+    let raw = count.checked_mul(w as u64)?.checked_add(7)? / 8 * 8;
+    if w == 5 { raw.checked_add(8) } else { Some(raw) }
+}
+
+/// Reads offsets entry `i` (4-byte u32 LE or 5-byte 40-bit LE). `None` if out of bounds.
+#[inline(always)]
+pub(crate) fn read_offset(d: &[u8], base: usize, w: usize, i: u64) -> Option<u64> {
+    let o = base.checked_add(usize::try_from(i).ok()?.checked_mul(w)?)?;
+    if w == 5 {
+        let c: [u8; 8] = d.get(o..o.checked_add(8)?)?.try_into().ok()?;
+        Some(u64::from_le_bytes(c) & 0xFF_FFFF_FFFF)
+    } else {
+        let c: [u8; 4] = d.get(o..o.checked_add(4)?)?.try_into().ok()?;
+        Some(u32::from_le_bytes(c) as u64)
+    }
+}
+
 /// Parsed, validated v2 (PTHash) header. All section offsets are absolute file offsets.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct V2Params {
@@ -145,6 +164,8 @@ pub(crate) struct V2Params {
     pub(crate) back_off: usize,
     pub(crate) free_off: usize,
     pub(crate) offsets_off: usize,
+    /// Bytes per offsets entry: 4 (u32 LE) or 5 (40-bit LE).
+    pub(crate) off_w: usize,
     pub(crate) blob_off: usize,
     /// Last offsets entry: length of the blob in bytes.
     pub(crate) blob_len: usize,
@@ -196,7 +217,12 @@ impl V2Params {
             block_shift = d[11] as u32;
             n_offsets = n.div_ceil(1u64 << block_shift) + 1;
         }
-        let off_bytes = (n_offsets * 4).div_ceil(8) * 8;
+        let off_w: usize = match d[52] {
+            0 | 4 => 4,
+            5 => 5,
+            _ => return Err(bad("unsupported offset width")),
+        };
+        let off_bytes = offsets_size(n_offsets, off_w).ok_or_else(|| bad("v2 offsets overflow"))?;
         let end = (V2_HEADER_SIZE as u64)
             .checked_add(fsz)
             .and_then(|v| v.checked_add(bsz))
@@ -212,14 +238,14 @@ impl V2Params {
         let free_off = back_off + bsz as usize;
         let offsets_off = free_off + free as usize;
         let blob_off = end as usize;
-        let lo = offsets_off + (n_offsets as usize - 1) * 4;
-        let blob_len = u32::from_le_bytes(d[lo..lo + 4].try_into().unwrap()) as u64;
+        let blob_len = read_offset(d, offsets_off, off_w, n_offsets - 1)
+            .ok_or_else(|| bad("v2 offsets out of bounds"))?;
         if (blob_off as u64) + blob_len + 4 > d.len() as u64 {
             return Err(bad("v2 blob size exceeds file"));
         }
         Ok(Self {
             n, m, nb, p2, p1thr, fw, bw,
-            front_off, back_off, free_off, offsets_off, blob_off,
+            front_off, back_off, free_off, offsets_off, off_w, blob_off,
             blob_len: blob_len as usize,
             compressed,
             block_shift,

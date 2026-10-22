@@ -12,7 +12,7 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::error::AttosError;
 use crate::stats::LatencyHistogram;
-use crate::v2::{lz4_decompress, next_record, uvarint, get_bits, V2Params, MAX_BLOCK_RAW};
+use crate::v2::{lz4_decompress, next_record, read_offset, uvarint, get_bits, V2Params, MAX_BLOCK_RAW};
 pub use crate::v2::{pthash_hp, pthash_mix, pthash_reduce};
 
 const MAGIC_ATTO: &[u8; 4] = b"ATTO";
@@ -430,10 +430,15 @@ impl AttosMap {
         self.entry(h, key)
     }
 
-    /// Copying lookup: appends the value to `dst` (no allocation if `dst` has
-    /// capacity). The result does not borrow the map.
+    /// Copying lookup: appends the value to `dst`. Works for every file kind
+    /// (plain files copy straight from the mapping; compressed files decode the
+    /// block first). The result does not borrow the map.
     #[inline]
     pub fn get_copy(&self, key: &[u8], dst: &mut Vec<u8>) -> Result<(), AttosError> {
+        if self.is_compressed() {
+            dst.extend_from_slice(&self.get_cow(key)?);
+            return Ok(());
+        }
         let v = self.get(key)?;
         dst.extend_from_slice(v);
         Ok(())
@@ -533,10 +538,8 @@ impl AttosMap {
     #[inline(always)]
     fn v2_record(&self, p: &V2Params, slot: u64) -> Result<&[u8], AttosError> {
         let corrupt = || AttosError::CorruptedBinary("payload index out of bounds".into());
-        let o = p.offsets_off + slot as usize * 4;
-        let b = self.mmap.get(o..o + 8).ok_or_else(corrupt)?;
-        let start = u32::from_le_bytes(b[0..4].try_into().unwrap()) as usize;
-        let end = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
+        let start = read_offset(&self.mmap, p.offsets_off, p.off_w, slot).ok_or_else(corrupt)? as usize;
+        let end = read_offset(&self.mmap, p.offsets_off, p.off_w, slot + 1).ok_or_else(corrupt)? as usize;
         if start > end || end > p.blob_len {
             return Err(corrupt());
         }
@@ -569,10 +572,8 @@ impl AttosMap {
     /// Returns the (blob-relative checked) bytes of block `b`, method byte included.
     fn v2_block(&self, p: &V2Params, b: u64) -> Result<&[u8], AttosError> {
         let corrupt = || AttosError::CorruptedBinary("block index out of bounds".into());
-        let o = p.offsets_off.checked_add((b as usize).checked_mul(4).ok_or_else(corrupt)?).ok_or_else(corrupt)?;
-        let w = self.mmap.get(o..o + 8).ok_or_else(corrupt)?;
-        let start = u32::from_le_bytes(w[0..4].try_into().unwrap()) as usize;
-        let end = u32::from_le_bytes(w[4..8].try_into().unwrap()) as usize;
+        let start = read_offset(&self.mmap, p.offsets_off, p.off_w, b).ok_or_else(corrupt)? as usize;
+        let end = read_offset(&self.mmap, p.offsets_off, p.off_w, b + 1).ok_or_else(corrupt)? as usize;
         if end <= start || end > p.blob_len {
             return Err(corrupt());
         }
