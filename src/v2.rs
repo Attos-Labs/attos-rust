@@ -15,6 +15,17 @@ pub fn pthash_mix(mut x: u64) -> u64 {
     x
 }
 
+/// Lean-keys fingerprint: FNV-1a 64 over the key, finished with the PTHash mix.
+/// The stored fingerprint is the first 4 or 8 bytes of its big-endian encoding.
+#[inline(always)]
+pub(crate) fn key_fingerprint(key: &[u8]) -> [u8; 8] {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &c in key {
+        h = (h ^ c as u64).wrapping_mul(0x100_0000_01b3);
+    }
+    pthash_mix(h).to_be_bytes()
+}
+
 /// Pilot hash: `mix(p + 0x1234567)`.
 #[inline(always)]
 pub fn pthash_hp(p: u64) -> u64 {
@@ -172,6 +183,8 @@ pub(crate) struct V2Params {
     /// flags bit 0: records are grouped into `1 << block_shift` slot blocks.
     pub(crate) compressed: bool,
     pub(crate) block_shift: u32,
+    /// flags bit 1: fingerprint width (4 or 8) when records store `fingerprint | value`, else 0.
+    pub(crate) lean_w: usize,
 }
 
 impl V2Params {
@@ -204,10 +217,17 @@ impl V2Params {
         let bsz = packed_size(nb - p2, bw).ok_or_else(|| bad("v2 back section overflow"))?;
         let free = ((m - n) * 4).div_ceil(8) * 8;
         let flags = d[8];
-        if flags & !1 != 0 {
+        if flags & !3 != 0 {
             return Err(bad("unsupported v2 flags"));
         }
         let compressed = flags & 1 != 0;
+        let mut lean_w = 0usize;
+        if flags & 2 != 0 {
+            lean_w = d[53] as usize;
+            if lean_w != 4 && lean_w != 8 {
+                return Err(bad("invalid fingerprint width"));
+            }
+        }
         let mut block_shift = 0u32;
         let mut n_offsets = n + 1;
         if compressed {
@@ -249,6 +269,7 @@ impl V2Params {
             blob_len: blob_len as usize,
             compressed,
             block_shift,
+            lean_w,
         })
     }
 }
@@ -288,6 +309,21 @@ mod tests {
         assert!(lz4_decompress(&mut dst, &[0x20, b'a', b'b']).is_err()); // short output
         let mut small = [0u8; 1];
         assert!(lz4_decompress(&mut small, &[0x20, b'a', b'b']).is_err()); // dst overflow
+    }
+
+    #[test]
+    fn fingerprint_matches_go() {
+        // Expected values produced by attos-go keyFingerprint.
+        let cases: &[(&[u8], &str)] = &[
+            (b"", "2180a92350d49cce"),
+            (b"a", "55e22b8ccbb1816f"),
+            (b"hello", "a6e623b229a85d74"),
+            (b"key\x00with\x00nul", "ada0d5aff9ff4838"),
+        ];
+        for (k, want) in cases {
+            let hex: String = key_fingerprint(k).iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(&hex, want, "key {:?}", k);
+        }
     }
 
     #[test]
