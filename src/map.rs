@@ -12,7 +12,7 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::error::AttosError;
 use crate::stats::LatencyHistogram;
-use crate::v2::{lz4_decompress, next_record, uvarint, get_bits, V2Params, MAX_BLOCK_RAW};
+use crate::v2::{key_fingerprint, lz4_decompress, next_record, read_offset, uvarint, get_bits, V2Params, MAX_BLOCK_RAW};
 pub use crate::v2::{pthash_hp, pthash_mix, pthash_reduce};
 
 const MAGIC_ATTO: &[u8; 4] = b"ATTO";
@@ -240,6 +240,11 @@ impl AttosMap {
         // mapping without invalidating it.
         let mmap = unsafe { MmapOptions::new().map(&file).map_err(AttosError::IoError)? };
         drop(file);
+        // The CRC pass (if requested) streams the whole mapping once.
+        #[cfg(unix)]
+        if check_crc {
+            let _ = mmap.advise(memmap2::Advice::Sequential);
+        }
         let v2 = if mmap.len() >= 8 && &mmap[0..4] == MAGIC_ATTO && mmap[4..8] == [0, 0, 0, 2] {
             Some(parse_v2(&mmap, check_crc)?)
         } else {
@@ -257,6 +262,18 @@ impl AttosMap {
             },
             None => parse_layout(&mmap, check_crc)?,
         };
+
+        // Serving RSS: a validation pass faulted every page into this process.
+        // Drop them from the process (page cache keeps them) so a validated map
+        // does not count the whole file as resident. Skipped when pinning, as
+        // mlock'd pages cannot be released and the caller asked for residency.
+        #[cfg(target_os = "linux")]
+        if check_crc && !config.pin_to_memory {
+            // SAFETY: read-only file-backed mapping; MADV_DONTNEED only drops
+            // the process's page-table entries and later accesses refault
+            // identical contents from the file.
+            let _ = unsafe { mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
+        }
 
         let mut pinned = false;
         if config.pin_to_memory {
@@ -379,7 +396,7 @@ impl AttosMap {
             }
             let slot = self.v2_slot(p, h)?;
             let payload = self.v2_record(p, slot)?;
-            return Self::split_record(payload, key);
+            return Self::split_record(p.lean_w, payload, key);
         }
         let data: &[u8] = &self.mmap;
         let bucket = ((h >> 32) as u32 as u64) % self.num_buckets;
@@ -430,10 +447,15 @@ impl AttosMap {
         self.entry(h, key)
     }
 
-    /// Copying lookup: appends the value to `dst` (no allocation if `dst` has
-    /// capacity). The result does not borrow the map.
+    /// Copying lookup: appends the value to `dst`. Works for every file kind
+    /// (plain files copy straight from the mapping; compressed files decode the
+    /// block first). The result does not borrow the map.
     #[inline]
     pub fn get_copy(&self, key: &[u8], dst: &mut Vec<u8>) -> Result<(), AttosError> {
+        if self.is_compressed() {
+            dst.extend_from_slice(&self.get_cow(key)?);
+            return Ok(());
+        }
         let v = self.get(key)?;
         dst.extend_from_slice(v);
         Ok(())
@@ -533,19 +555,28 @@ impl AttosMap {
     #[inline(always)]
     fn v2_record(&self, p: &V2Params, slot: u64) -> Result<&[u8], AttosError> {
         let corrupt = || AttosError::CorruptedBinary("payload index out of bounds".into());
-        let o = p.offsets_off + slot as usize * 4;
-        let b = self.mmap.get(o..o + 8).ok_or_else(corrupt)?;
-        let start = u32::from_le_bytes(b[0..4].try_into().unwrap()) as usize;
-        let end = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
+        let start = read_offset(&self.mmap, p.offsets_off, p.off_w, slot).ok_or_else(corrupt)? as usize;
+        let end = read_offset(&self.mmap, p.offsets_off, p.off_w, slot + 1).ok_or_else(corrupt)? as usize;
         if start > end || end > p.blob_len {
             return Err(corrupt());
         }
         self.mmap.get(p.blob_off + start..p.blob_off + end).ok_or_else(corrupt)
     }
 
-    /// Splits a record and returns its value if the stored key equals `key`.
+    /// Splits a record and returns its value if the stored key (or, for lean files,
+    /// the stored fingerprint) matches `key`.
     #[inline(always)]
-    fn split_record<'a>(payload: &'a [u8], key: &[u8]) -> Result<&'a [u8], AttosError> {
+    fn split_record<'a>(lean_w: usize, payload: &'a [u8], key: &[u8]) -> Result<&'a [u8], AttosError> {
+        if lean_w != 0 {
+            if payload.len() < lean_w {
+                return Err(AttosError::CorruptedBinary("payload too small for fingerprint".into()));
+            }
+            let fp = key_fingerprint(key);
+            if payload[..lean_w] != fp[..lean_w] {
+                return Err(AttosError::KeyNotFound);
+            }
+            return Ok(&payload[lean_w..]);
+        }
         if payload.len() < 2 {
             return Err(AttosError::CorruptedBinary("payload too small for key length".into()));
         }
@@ -569,10 +600,8 @@ impl AttosMap {
     /// Returns the (blob-relative checked) bytes of block `b`, method byte included.
     fn v2_block(&self, p: &V2Params, b: u64) -> Result<&[u8], AttosError> {
         let corrupt = || AttosError::CorruptedBinary("block index out of bounds".into());
-        let o = p.offsets_off.checked_add((b as usize).checked_mul(4).ok_or_else(corrupt)?).ok_or_else(corrupt)?;
-        let w = self.mmap.get(o..o + 8).ok_or_else(corrupt)?;
-        let start = u32::from_le_bytes(w[0..4].try_into().unwrap()) as usize;
-        let end = u32::from_le_bytes(w[4..8].try_into().unwrap()) as usize;
+        let start = read_offset(&self.mmap, p.offsets_off, p.off_w, b).ok_or_else(corrupt)? as usize;
+        let end = read_offset(&self.mmap, p.offsets_off, p.off_w, b + 1).ok_or_else(corrupt)? as usize;
         if end <= start || end > p.blob_len {
             return Err(corrupt());
         }
@@ -628,7 +657,7 @@ impl AttosMap {
         }
         let value_range = {
             let r = &raw[rec.0..rec.1];
-            let v = Self::split_record(r, key)?;
+            let v = Self::split_record(p.lean_w, r, key)?;
             let off = rec.1 - v.len();
             off..rec.1
         };
@@ -687,6 +716,12 @@ impl AttosMap {
                 let Some((s, e)) = next_record(&raw, pos) else { return };
                 pos = e;
                 let rec = &raw[s..e];
+                if p.lean_w != 0 {
+                    if rec.len() < p.lean_w || !callback(&rec[..p.lean_w], &rec[p.lean_w..]) {
+                        return;
+                    }
+                    continue;
+                }
                 if rec.len() < 2 {
                     return;
                 }
@@ -705,7 +740,13 @@ impl AttosMap {
         }
         for i in 0..p.n {
             if let Ok(payload) = self.v2_record(p, i) {
-                if payload.len() >= 2 {
+                if p.lean_w != 0 {
+                    if payload.len() >= p.lean_w
+                        && !callback(&payload[..p.lean_w], &payload[p.lean_w..])
+                    {
+                        break;
+                    }
+                } else if payload.len() >= 2 {
                     let key_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
                     if let Some(k) = payload.get(2..2 + key_len) {
                         if !callback(k, &payload[2 + key_len..]) {

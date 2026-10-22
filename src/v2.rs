@@ -15,6 +15,17 @@ pub fn pthash_mix(mut x: u64) -> u64 {
     x
 }
 
+/// Lean-keys fingerprint: FNV-1a 64 over the key, finished with the PTHash mix.
+/// The stored fingerprint is the first 4 or 8 bytes of its big-endian encoding.
+#[inline(always)]
+pub(crate) fn key_fingerprint(key: &[u8]) -> [u8; 8] {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &c in key {
+        h = (h ^ c as u64).wrapping_mul(0x100_0000_01b3);
+    }
+    pthash_mix(h).to_be_bytes()
+}
+
 /// Pilot hash: `mix(p + 0x1234567)`.
 #[inline(always)]
 pub fn pthash_hp(p: u64) -> u64 {
@@ -131,6 +142,25 @@ pub(crate) fn packed_size(count: u64, w: u64) -> Option<u64> {
     words.checked_mul(8)?.checked_add(8)
 }
 
+/// Size in bytes of the offsets section: `ceil(count*w/8)*8`, plus 8 bytes of slack when `w == 5`.
+pub(crate) fn offsets_size(count: u64, w: usize) -> Option<u64> {
+    let raw = count.checked_mul(w as u64)?.checked_add(7)? / 8 * 8;
+    if w == 5 { raw.checked_add(8) } else { Some(raw) }
+}
+
+/// Reads offsets entry `i` (4-byte u32 LE or 5-byte 40-bit LE). `None` if out of bounds.
+#[inline(always)]
+pub(crate) fn read_offset(d: &[u8], base: usize, w: usize, i: u64) -> Option<u64> {
+    let o = base.checked_add(usize::try_from(i).ok()?.checked_mul(w)?)?;
+    if w == 5 {
+        let c: [u8; 8] = d.get(o..o.checked_add(8)?)?.try_into().ok()?;
+        Some(u64::from_le_bytes(c) & 0xFF_FFFF_FFFF)
+    } else {
+        let c: [u8; 4] = d.get(o..o.checked_add(4)?)?.try_into().ok()?;
+        Some(u32::from_le_bytes(c) as u64)
+    }
+}
+
 /// Parsed, validated v2 (PTHash) header. All section offsets are absolute file offsets.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct V2Params {
@@ -145,12 +175,16 @@ pub(crate) struct V2Params {
     pub(crate) back_off: usize,
     pub(crate) free_off: usize,
     pub(crate) offsets_off: usize,
+    /// Bytes per offsets entry: 4 (u32 LE) or 5 (40-bit LE).
+    pub(crate) off_w: usize,
     pub(crate) blob_off: usize,
     /// Last offsets entry: length of the blob in bytes.
     pub(crate) blob_len: usize,
     /// flags bit 0: records are grouped into `1 << block_shift` slot blocks.
     pub(crate) compressed: bool,
     pub(crate) block_shift: u32,
+    /// flags bit 1: fingerprint width (4 or 8) when records store `fingerprint | value`, else 0.
+    pub(crate) lean_w: usize,
 }
 
 impl V2Params {
@@ -183,10 +217,17 @@ impl V2Params {
         let bsz = packed_size(nb - p2, bw).ok_or_else(|| bad("v2 back section overflow"))?;
         let free = ((m - n) * 4).div_ceil(8) * 8;
         let flags = d[8];
-        if flags & !1 != 0 {
+        if flags & !3 != 0 {
             return Err(bad("unsupported v2 flags"));
         }
         let compressed = flags & 1 != 0;
+        let mut lean_w = 0usize;
+        if flags & 2 != 0 {
+            lean_w = d[53] as usize;
+            if lean_w != 4 && lean_w != 8 {
+                return Err(bad("invalid fingerprint width"));
+            }
+        }
         let mut block_shift = 0u32;
         let mut n_offsets = n + 1;
         if compressed {
@@ -196,7 +237,12 @@ impl V2Params {
             block_shift = d[11] as u32;
             n_offsets = n.div_ceil(1u64 << block_shift) + 1;
         }
-        let off_bytes = (n_offsets * 4).div_ceil(8) * 8;
+        let off_w: usize = match d[52] {
+            0 | 4 => 4,
+            5 => 5,
+            _ => return Err(bad("unsupported offset width")),
+        };
+        let off_bytes = offsets_size(n_offsets, off_w).ok_or_else(|| bad("v2 offsets overflow"))?;
         let end = (V2_HEADER_SIZE as u64)
             .checked_add(fsz)
             .and_then(|v| v.checked_add(bsz))
@@ -212,17 +258,18 @@ impl V2Params {
         let free_off = back_off + bsz as usize;
         let offsets_off = free_off + free as usize;
         let blob_off = end as usize;
-        let lo = offsets_off + (n_offsets as usize - 1) * 4;
-        let blob_len = u32::from_le_bytes(d[lo..lo + 4].try_into().unwrap()) as u64;
+        let blob_len = read_offset(d, offsets_off, off_w, n_offsets - 1)
+            .ok_or_else(|| bad("v2 offsets out of bounds"))?;
         if (blob_off as u64) + blob_len + 4 > d.len() as u64 {
             return Err(bad("v2 blob size exceeds file"));
         }
         Ok(Self {
             n, m, nb, p2, p1thr, fw, bw,
-            front_off, back_off, free_off, offsets_off, blob_off,
+            front_off, back_off, free_off, offsets_off, off_w, blob_off,
             blob_len: blob_len as usize,
             compressed,
             block_shift,
+            lean_w,
         })
     }
 }
@@ -262,6 +309,21 @@ mod tests {
         assert!(lz4_decompress(&mut dst, &[0x20, b'a', b'b']).is_err()); // short output
         let mut small = [0u8; 1];
         assert!(lz4_decompress(&mut small, &[0x20, b'a', b'b']).is_err()); // dst overflow
+    }
+
+    #[test]
+    fn fingerprint_matches_go() {
+        // Expected values produced by attos-go keyFingerprint.
+        let cases: &[(&[u8], &str)] = &[
+            (b"", "2180a92350d49cce"),
+            (b"a", "55e22b8ccbb1816f"),
+            (b"hello", "a6e623b229a85d74"),
+            (b"key\x00with\x00nul", "ada0d5aff9ff4838"),
+        ];
+        for (k, want) in cases {
+            let hex: String = key_fingerprint(k).iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(&hex, want, "key {:?}", k);
+        }
     }
 
     #[test]
