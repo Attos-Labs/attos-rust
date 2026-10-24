@@ -24,7 +24,7 @@ scripts/release-gate/run.sh        # every format option combination read back b
 ```bash
 cd attos-rust
 cargo fmt --check && cargo clippy --all-targets -- -D warnings   # optional but recommended
-cargo test --release                                             # about 2 minutes
+cargo test --release                                          
 ./run_tests.sh
 ```
 
