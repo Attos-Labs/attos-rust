@@ -102,3 +102,7 @@ let value = map.get_string("user_123")?;
 ## Errors
 
 `AttosError::KeyNotFound` means the key is not in the current dataset. Validation failures (bad magic, unsupported version, corrupt or checksum-failing blob) are typed variants of `AttosError`. While a sync fails, the SDK keeps serving the last good blob.
+
+## Format compatibility
+
+This SDK reads `.attos` format versions 1 and 2 (PTHash, LZ4 blocks, 40-bit offsets, lean keys) from the first release that contains them, and fails closed with an error that names the unsupported feature and says to upgrade the SDK when it meets a newer file. The full table of format features against SDK versions is in [docs/FORMAT_COMPATIBILITY.md](https://github.com/Attos-Labs/attos-cloud/blob/main/docs/FORMAT_COMPATIBILITY.md).
