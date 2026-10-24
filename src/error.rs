@@ -8,6 +8,8 @@ pub enum AttosError {
     CorruptedBinary(String),
     InvalidMagic,
     InvalidVersion(u32),
+    /// The file is intact (CRC verifies) but uses a format feature newer than this SDK; upgrade the SDK.
+    UnsupportedFeature(String),
     ChecksumMismatch { expected: u32, actual: u32 },
     MapClosed,
     /// The file stores compressed blocks; use `get_cow` / `get_owned` instead of the zero-copy API.
@@ -37,7 +39,18 @@ impl fmt::Display for AttosError {
             AttosError::KeyNotFound => write!(f, "key not found"),
             AttosError::CorruptedBinary(msg) => write!(f, "corrupted binary: {}", msg),
             AttosError::InvalidMagic => write!(f, "invalid magic bytes"),
-            AttosError::InvalidVersion(v) => write!(f, "invalid version: {}", v),
+            AttosError::InvalidVersion(v) => write!(
+                f,
+                "invalid version: unsupported format version {} (attos-client {} reads versions 1-2); upgrade the Attos SDK",
+                v,
+                crate::VERSION
+            ),
+            AttosError::UnsupportedFeature(feat) => write!(
+                f,
+                "unsupported format feature: {} (attos-client {} does not support it); upgrade the Attos SDK",
+                feat,
+                crate::VERSION
+            ),
             AttosError::ChecksumMismatch { expected, actual } => {
                 write!(f, "checksum mismatch: trailer {:#010x}, computed {:#010x}", expected, actual)
             }

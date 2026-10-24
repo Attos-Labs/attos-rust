@@ -190,6 +190,16 @@ pub(crate) struct V2Params {
 impl V2Params {
     pub(crate) fn parse(d: &[u8]) -> Result<Self, AttosError> {
         let bad = |m: &str| AttosError::CorruptedBinary(m.into());
+        // An unknown header feature is reported as UnsupportedFeature only when the file's CRC
+        // trailer verifies (intact file written by a newer SDK); otherwise the header is damaged.
+        let unsupported = |feature: String, corrupt: &str| {
+            let e = d.len() - 4;
+            if u32::from_be_bytes(d[e..].try_into().unwrap()) == crc32fast::hash(&d[..e]) {
+                AttosError::UnsupportedFeature(feature)
+            } else {
+                bad(corrupt)
+            }
+        };
         if d.len() < V2_HEADER_SIZE + 4 {
             return Err(bad("file too small for v2 header"));
         }
@@ -218,14 +228,14 @@ impl V2Params {
         let free = ((m - n) * 4).div_ceil(8) * 8;
         let flags = d[8];
         if flags & !3 != 0 {
-            return Err(bad("unsupported v2 flags"));
+            return Err(unsupported(format!("flags {:#04x} (unknown bits {:#04x})", flags, flags & !3), "unsupported v2 flags"));
         }
         let compressed = flags & 1 != 0;
         let mut lean_w = 0usize;
         if flags & 2 != 0 {
             lean_w = d[53] as usize;
             if lean_w != 4 && lean_w != 8 {
-                return Err(bad("invalid fingerprint width"));
+                return Err(unsupported(format!("lean-key fingerprint width {}", lean_w), "invalid fingerprint width"));
             }
         }
         let mut block_shift = 0u32;
@@ -240,7 +250,7 @@ impl V2Params {
         let off_w: usize = match d[52] {
             0 | 4 => 4,
             5 => 5,
-            _ => return Err(bad("unsupported offset width")),
+            w => return Err(unsupported(format!("offset width {}", w), "unsupported offset width")),
         };
         let off_bytes = offsets_size(n_offsets, off_w).ok_or_else(|| bad("v2 offsets overflow"))?;
         let end = (V2_HEADER_SIZE as u64)
