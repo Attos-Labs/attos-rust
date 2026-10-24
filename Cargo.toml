@@ -19,3 +19,8 @@ tracing = "0.1"
 [dev-dependencies]
 tempfile = "3.8.1"
 allocation-counter = "0.8.1"
+criterion = "0.5"
+
+[[bench]]
+name = "lookup"
+harness = false
