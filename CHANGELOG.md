@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (first release with v2 readers; suggested version 1.3.0)
+## 1.3.0 - 2026-10-31
 
 * Fail closed with an explicit error when a file uses a format feature newer than the SDK: `AttosError::UnsupportedFeature` for unknown flag bits, offset widths and fingerprint widths on an intact file; `InvalidVersion` now says to upgrade.
 * PTHash v2 format reader with LZ4 blocks and 40-bit offsets (`get_cow`/`get_owned` for compressed files).
