@@ -21,7 +21,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc as stdmpsc, Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use reqwest::Url;
+use crate::redirect::{same_origin_host, RedirectPolicy};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -61,6 +63,20 @@ pub struct SyncConfig {
     pub telemetry_retry_delays: Vec<Duration>,
     /// Base unit of the transient back-off (default 1 s). Exposed for tests.
     pub backoff_base: Duration,
+    /// Ask for patches (`X-Attos-Capabilities: overflow`, `X-Attos-Accept-Delta: 2`; default true). A patch that
+    /// fails to apply is retried as a full blob either way.
+    pub delta: bool,
+    /// Ask for signed redirects (`X-Attos-Capabilities: redirect`; default true).
+    pub redirect: bool,
+    /// Extra hosts a signed-download redirect may point at, on top of Google Cloud Storage
+    /// (`storage.googleapis.com`, `*.storage.googleapis.com`): exact hosts or `*.domain`. The
+    /// `ATTOS_REDIRECT_HOSTS` environment variable (comma separated) is added to them. Targets must be https
+    /// on port 443 without userinfo.
+    pub redirect_hosts: Vec<String>,
+    /// How long redirects stay off after a signed download failed (default 1 h).
+    pub redirect_cooldown: Duration,
+    /// Tests against local servers only: lifts the redirect host policy (http, IP literals, any host).
+    pub test_redirect_any_target: bool,
 }
 
 impl SyncConfig {
@@ -80,6 +96,11 @@ impl SyncConfig {
             http_timeout: Duration::from_secs(600),
             telemetry_retry_delays: vec![Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(4)],
             backoff_base: Duration::from_secs(1),
+            delta: true,
+            redirect: true,
+            redirect_hosts: Vec::new(),
+            redirect_cooldown: Duration::from_secs(3600),
+            test_redirect_any_target: false,
         }
     }
 }
@@ -105,6 +126,12 @@ struct Inner {
     telemetry_enabled: AtomicBool,
     crc_errors: AtomicU64,
     tel: TelemetryState,
+    policy: RedirectPolicy,
+    redirect_off: Mutex<Option<Instant>>,
+    delta_applied: AtomicU64,
+    delta_fallbacks: AtomicU64,
+    redirected: AtomicU64,
+    redirect_fallbacks: AtomicU64,
 }
 
 /// Background synchronizer: download → fsync → validate → rename → mmap →
@@ -225,6 +252,11 @@ impl AttosSynchronizer {
             return Err(AttosError::Config("dataset_id is required".into()));
         }
         fs::create_dir_all(&cfg.cache_dir)?;
+        let policy = RedirectPolicy::new(
+            &cfg.redirect_hosts,
+            std::env::var(crate::redirect::REDIRECT_HOSTS_ENV).ok().as_deref(),
+            cfg.test_redirect_any_target,
+        );
         let inner = Arc::new(Inner {
             cfg,
             node_id,
@@ -233,6 +265,12 @@ impl AttosSynchronizer {
             telemetry_enabled: AtomicBool::new(true),
             crc_errors: AtomicU64::new(0),
             tel: TelemetryState::default(),
+            policy,
+            redirect_off: Mutex::new(None),
+            delta_applied: AtomicU64::new(0),
+            delta_fallbacks: AtomicU64::new(0),
+            redirected: AtomicU64::new(0),
+            redirect_fallbacks: AtomicU64::new(0),
         });
         remove_stale_temps(&inner);
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -304,6 +342,15 @@ impl AttosSynchronizer {
     pub fn crc_errors(&self) -> u64 {
         self.inner.crc_errors.load(Ordering::Relaxed)
     }
+    /// `(applied, fallbacks)`: syncs completed from a patch, and patches that failed and fell back to a full blob.
+    pub fn delta_stats(&self) -> (u64, u64) {
+        (self.inner.delta_applied.load(Ordering::Relaxed), self.inner.delta_fallbacks.load(Ordering::Relaxed))
+    }
+    /// `(redirected, fallbacks)`: syncs completed from a signed URL, and signed downloads that failed and were
+    /// repeated through the sync endpoint.
+    pub fn redirect_stats(&self) -> (u64, u64) {
+        (self.inner.redirected.load(Ordering::Relaxed), self.inner.redirect_fallbacks.load(Ordering::Relaxed))
+    }
 
     /// Stop the background thread and unmap all data (waits for readers up to 5 s).
     pub fn shutdown(&self) {
@@ -359,7 +406,7 @@ async fn run(
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     ready: stdmpsc::Sender<Result<AttosClient, AttosError>>,
 ) {
-    let http = match reqwest::Client::builder().timeout(inner.cfg.http_timeout).build() {
+    let http = match reqwest::Client::builder().timeout(inner.cfg.http_timeout).redirect(reqwest::redirect::Policy::none()).build() {
         Ok(c) => c,
         Err(e) => {
             let _ = ready.send(Err(AttosError::Transport(e.to_string())));
@@ -468,87 +515,291 @@ impl Sink {
     }
 }
 
-/// One conditional GET; on 200 install the blob per the §4 swap invariant.
+/// A failed sync attempt, classified so `sync_once` can pick the fallback.
+enum Fail {
+    /// The signed-URL download failed (refused host, expired, HTTP error, truncated/corrupt body, bad patch).
+    Redirect(AttosError),
+    /// A patch could not be applied; the full blob is the safe path.
+    Delta(AttosError),
+    Other(AttosError),
+}
+
+impl From<AttosError> for Fail {
+    fn from(e: AttosError) -> Self {
+        Fail::Other(e)
+    }
+}
+
+impl From<std::io::Error> for Fail {
+    fn from(e: std::io::Error) -> Self {
+        Fail::Other(AttosError::IoError(e))
+    }
+}
+
+/// The response whose bytes are installed: the 200 itself, or the object behind a signed 302 (headers of the
+/// 302, body of the download).
+struct Effective {
+    headers: reqwest::header::HeaderMap,
+    body: reqwest::Response,
+    /// Body length the sender declared (Content-Length, or X-Attos-Content-Length for a redirect).
+    declared: Option<u64>,
+    redirected: bool,
+}
+
+const MAX_ORDINARY_REDIRECTS: usize = 10;
+const SIGNED_LENGTH_HEADER: &str = "x-attos-content-length";
+const SIGNED_ENCODING_HEADER: &str = "x-attos-content-encoding";
+
+fn hv(r: &reqwest::header::HeaderMap, k: &str) -> Option<String> {
+    r.get(k).and_then(|v| v.to_str().ok()).map(String::from)
+}
+
+/// One sync, with the fallbacks of the Go SDK: a failed signed download is repeated through the endpoint
+/// (`X-Attos-No-Redirect: 1`) and switches redirects off for `redirect_cooldown`; a failed patch is repeated
+/// without delta capabilities, i.e. as a full blob.
 async fn sync_once(
     inner: &Inner,
     http: &reqwest::Client,
     client: &mut Option<AttosClient>,
 ) -> Result<SyncOutcome, AttosError> {
-    let url = format!("{}/api/v1/datasets/sync/{}", inner.cfg.base_url, inner.cfg.dataset_id);
+    let mut allow_delta = inner.cfg.delta;
+    let mut allow_redirect = inner.cfg.redirect && redirect_allowed_now(inner);
+    loop {
+        match sync_attempt(inner, http, client, allow_delta, allow_redirect).await {
+            Ok(o) => return Ok(o),
+            Err(Fail::Redirect(e)) if allow_redirect => {
+                inner.redirect_fallbacks.fetch_add(1, Ordering::Relaxed);
+                // Stop asking for a while: a node that cannot reach the download host would otherwise be handed
+                // a URL, fail, and stream the same bytes through the endpoint on every sync, billed twice each time.
+                *inner.redirect_off.lock().unwrap() = Some(Instant::now() + inner.cfg.redirect_cooldown);
+                warn!("signed download failed ({}); fetching through the sync endpoint, no redirects for {:?}", e, inner.cfg.redirect_cooldown);
+                allow_redirect = false;
+            }
+            Err(Fail::Delta(e)) if allow_delta => {
+                inner.delta_fallbacks.fetch_add(1, Ordering::Relaxed);
+                warn!("delta update failed ({}); downloading the full blob", e);
+                allow_delta = false;
+            }
+            Err(Fail::Redirect(e)) | Err(Fail::Delta(e)) | Err(Fail::Other(e)) => return Err(e),
+        }
+    }
+}
+
+fn redirect_allowed_now(inner: &Inner) -> bool {
+    inner.redirect_off.lock().unwrap().map_or(true, |t| Instant::now() >= t)
+}
+
+/// Builds the sync GET. `creds` = false drops the API key and node id (a redirect to another host).
+fn sync_request(
+    inner: &Inner,
+    http: &reqwest::Client,
+    url: &str,
+    creds: bool,
+    have_blob: bool,
+    allow_delta: bool,
+    allow_redirect: bool,
+) -> reqwest::RequestBuilder {
     let mut req = http
-        .get(&url)
-        .header("X-API-Key", &inner.cfg.api_key)
-        .header("X-Attos-Node-ID", &inner.node_id)
+        .get(url)
         .header("User-Agent", format!("attos-rust/{}", crate::VERSION))
         .header("Accept-Encoding", if inner.cfg.compression { "gzip" } else { "identity" });
-    let etag = inner.etag.lock().unwrap().clone();
-    if let (Some(e), Some(_)) = (&etag, client.as_ref()) {
-        req = req.header("If-None-Match", e);
+    if creds {
+        req = req.header("X-API-Key", &inner.cfg.api_key).header("X-Attos-Node-ID", &inner.node_id);
     }
-    let mut resp = req.send().await.map_err(|e| AttosError::Transport(e.to_string()))?;
-    let status = resp.status().as_u16();
-    if status == 304 {
-        return Ok(SyncOutcome::NotModified);
+    if have_blob {
+        if let Some(e) = inner.etag.lock().unwrap().clone() {
+            req = req.header("If-None-Match", e);
+        }
     }
-    if status != 200 {
-        let retry_after = if status == 402 || status == 429 {
-            parse_retry_after(resp.headers().get("retry-after"))
-        } else {
-            None
-        };
-        return Err(AttosError::HttpStatus { code: status, retry_after });
+    // Capabilities are sent on every request, a first sync included, so a fresh node can be given the
+    // overflow-capable file that later tail patches build on.
+    let mut caps: Vec<&str> = Vec::new();
+    if allow_delta {
+        req = req.header("X-Attos-Accept-Delta", "2");
+        caps.push("overflow");
     }
-    let new_etag = resp.headers().get("etag").and_then(|v| v.to_str().ok()).map(String::from);
-    let cfg_hdr = resp.headers().get("x-attos-config").and_then(|v| v.to_str().ok()).map(String::from);
-    let name = resp.headers().get("x-dataset-name").and_then(|v| v.to_str().ok()).map(String::from);
-    let content_length = resp.content_length();
-    let gzip = match resp.headers().get("content-encoding").and_then(|v| v.to_str().ok()) {
+    if allow_redirect {
+        caps.push("redirect");
+    } else if inner.cfg.redirect {
+        req = req.header("X-Attos-No-Redirect", "1"); // fallback after a failed signed download: stream it
+    }
+    if !caps.is_empty() {
+        req = req.header("X-Attos-Capabilities", caps.join(","));
+    }
+    req
+}
+
+/// Sends the sync request, following ordinary redirects by hand: never from https to http, never to a host
+/// outside the policy, and the API key and node id travel only to the original host. A redirect that the sync
+/// endpoint marks as a signed download (`X-Attos-Content-Length`) is returned as is.
+async fn send_sync(
+    inner: &Inner,
+    http: &reqwest::Client,
+    have_blob: bool,
+    allow_delta: bool,
+    allow_redirect: bool,
+) -> Result<reqwest::Response, AttosError> {
+    let first = Url::parse(&format!("{}/api/v1/datasets/sync/{}", inner.cfg.base_url, inner.cfg.dataset_id))
+        .map_err(|e| AttosError::Config(format!("invalid base_url: {}", e)))?;
+    let mut cur = first.clone();
+    for _ in 0..=MAX_ORDINARY_REDIRECTS {
+        let creds = same_origin_host(&cur, &first);
+        let resp = sync_request(inner, http, cur.as_str(), creds, have_blob, allow_delta, allow_redirect)
+            .send()
+            .await
+            .map_err(|e| AttosError::Transport(e.to_string()))?;
+        let st = resp.status();
+        if !st.is_redirection() || resp.headers().contains_key(SIGNED_LENGTH_HEADER) {
+            return Ok(resp);
+        }
+        let Some(loc) = hv(resp.headers(), "location") else { return Ok(resp) };
+        let next = cur.join(&loc).map_err(|e| AttosError::Transport(format!("bad redirect location: {}", e)))?;
+        inner.policy.allows_ordinary(&next, &first).map_err(AttosError::Transport)?;
+        cur = next;
+    }
+    Err(AttosError::Transport("stopped after 10 redirects".into()))
+}
+
+/// Downloads the object behind a signed redirect. The request is built from scratch: no X-API-Key,
+/// Authorization or node id, and the download itself is never redirected again.
+async fn fetch_redirect(inner: &Inner, http: &reqwest::Client, r302: reqwest::Response) -> Result<Effective, AttosError> {
+    let t = |m: String| AttosError::Transport(m);
+    let loc = hv(r302.headers(), "location").unwrap_or_default();
+    let u = Url::parse(&loc).map_err(|e| t(format!("unusable redirect target: {}", e)))?;
+    inner.policy.check(&u).map_err(t)?;
+    let declared: u64 = hv(r302.headers(), SIGNED_LENGTH_HEADER)
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| t("invalid X-Attos-Content-Length".into()))?;
+    let resp = http
+        .get(u)
+        .header("User-Agent", format!("attos-rust/{}", crate::VERSION))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .map_err(|e| t(format!("signed download: {}", e)))?;
+    if resp.status().as_u16() != 200 {
+        return Err(t(format!("signed download: HTTP {}", resp.status().as_u16())));
+    }
+    if let Some(cl) = resp.content_length() {
+        if cl != declared {
+            return Err(t(format!("signed download: {} bytes, expected {}", cl, declared)));
+        }
+    }
+    let mut headers = r302.headers().clone();
+    headers.remove("location");
+    headers.remove("content-encoding");
+    if let Some(enc) = headers.get(SIGNED_ENCODING_HEADER).cloned() {
+        headers.insert("content-encoding", enc);
+    }
+    Ok(Effective { headers, body: resp, declared: Some(declared), redirected: true })
+}
+
+/// One conditional GET; on 200 install the blob (or rebuild it from a patch) per the §4 swap invariant.
+async fn sync_attempt(
+    inner: &Inner,
+    http: &reqwest::Client,
+    client: &mut Option<AttosClient>,
+    allow_delta: bool,
+    allow_redirect: bool,
+) -> Result<SyncOutcome, Fail> {
+    let resp = send_sync(inner, http, client.is_some(), allow_delta, allow_redirect).await?;
+    // A signed redirect: the bytes come from a short-lived URL, fetched WITHOUT any credential header;
+    // everything else about the response is read from this 302.
+    let mut eff = if resp.status().as_u16() == 302 && resp.headers().contains_key(SIGNED_LENGTH_HEADER) {
+        fetch_redirect(inner, http, resp).await.map_err(Fail::Redirect)?
+    } else {
+        Effective { headers: resp.headers().clone(), declared: resp.content_length(), body: resp, redirected: false }
+    };
+    let redirected = eff.redirected;
+    // A failure while handling redirected bytes is a redirect failure.
+    let fail = move |e: AttosError| if redirected { Fail::Redirect(e) } else { Fail::Other(e) };
+    let status = eff.body.status().as_u16();
+    if !redirected {
+        if status == 304 {
+            return Ok(SyncOutcome::NotModified);
+        }
+        if status != 200 {
+            let retry_after = if status == 402 || status == 429 {
+                parse_retry_after(eff.headers.get("retry-after"))
+            } else {
+                None
+            };
+            return Err(AttosError::HttpStatus { code: status, retry_after }.into());
+        }
+    }
+    let new_etag = hv(&eff.headers, "etag");
+    let cfg_hdr = hv(&eff.headers, "x-attos-config");
+    let name = hv(&eff.headers, "x-dataset-name");
+    let is_patch = hv(&eff.headers, "x-attos-delta").as_deref() == Some("1");
+    let gzip = match hv(&eff.headers, "content-encoding").as_deref() {
         None | Some("identity") => false,
         Some("gzip") => true,
-        Some(other) => return Err(AttosError::Transport(format!("unsupported Content-Encoding {:?}", other))),
+        Some(other) => return Err(fail(AttosError::Transport(format!("unsupported Content-Encoding {:?}", other)))),
     };
+    if is_patch && gzip {
+        return Err(Fail::Delta(AttosError::Transport("unsupported Content-Encoding on a patch".into())));
+    }
 
     // Download to a temp file in the same directory as the live blob.
-    let tmp = inner
-        .cfg
-        .cache_dir
-        .join(format!("{}{:016x}", temp_prefix(inner), RandomState::new().build_hasher().finish()));
+    let rnd = || RandomState::new().build_hasher().finish();
+    let tmp = inner.cfg.cache_dir.join(format!("{}{:016x}", temp_prefix(inner), rnd()));
     let mut guard = TempGuard(Some(tmp.clone()));
-    // Compressed sync (CONTRACTS §4): a gzip body is decompressed while it is
-    // written. Content-Length counts wire bytes; an incomplete or corrupted
-    // gzip stream fails its trailer check, and the decompressed blob still
-    // gets the full v1 validation (CRC32) below.
-    let file = fs::File::create(&tmp)?;
+    let mut patch_guard = TempGuard(None);
+    // Compressed sync (CONTRACTS §4): a gzip body is decompressed while it is written. Content-Length counts
+    // wire bytes; an incomplete or corrupted gzip stream fails its trailer check, and the decompressed blob
+    // still gets the full validation (CRC32) below. A patch goes to its own temp file first.
+    let dl_path = if is_patch {
+        let p = inner.cfg.cache_dir.join(format!("{}patch-{:016x}", temp_prefix(inner), rnd()));
+        patch_guard.0 = Some(p.clone());
+        p
+    } else {
+        tmp.clone()
+    };
+    let file = fs::File::create(&dl_path)?;
     let mut out = if gzip { Sink::Gzip(flate2::write::GzDecoder::new(file)) } else { Sink::Raw(file) };
     let mut written: u64 = 0;
     loop {
-        match resp.chunk().await {
+        match eff.body.chunk().await {
             Ok(Some(c)) => {
-                out.write_all(&c)
-                    .map_err(|e| AttosError::Transport(format!("corrupt download: {}", e)))?;
                 written += c.len() as u64;
+                // Never take more than one byte past the declared size of a signed download.
+                if let (true, Some(d)) = (redirected, eff.declared) {
+                    if written > d {
+                        return Err(fail(AttosError::Transport(format!("signed download larger than the declared {} bytes", d))));
+                    }
+                }
+                out.write_all(&c)
+                    .map_err(|e| fail(AttosError::Transport(format!("corrupt download: {}", e))))?;
             }
             Ok(None) => break,
-            Err(e) => return Err(AttosError::Transport(format!("download interrupted: {}", e))),
+            Err(e) => return Err(fail(AttosError::Transport(format!("download interrupted: {}", e)))),
         }
     }
-    if let Some(cl) = content_length {
+    if let Some(cl) = eff.declared {
         if cl != written {
-            return Err(AttosError::Transport(format!("truncated download: {} of {} bytes", written, cl)));
+            return Err(fail(AttosError::Transport(format!("truncated download: {} of {} bytes", written, cl))));
         }
     }
-    let f = out.finish()?;
+    let f = out.finish().map_err(fail)?;
     f.sync_all()?;
     drop(f);
-    // Validate the complete file (magic, version, flag, sizes, CRC) before it
-    // can become visible.
+
+    if is_patch {
+        let rebuilt = rebuild_from_patch(inner, &eff.headers, &dl_path, &tmp);
+        if let Err(e) = rebuilt {
+            return Err(if redirected { Fail::Redirect(e) } else { Fail::Delta(e) });
+        }
+        drop(patch_guard);
+    }
+
+    // Validate the complete file (magic, version, flag, sizes, CRC) before it can become visible.
     let map = match AttosMap::open_inner(&tmp, inner.cfg.open, true) {
         Ok(m) => m,
         Err(e) => {
             if matches!(e, AttosError::ChecksumMismatch { .. }) {
                 inner.crc_errors.fetch_add(1, Ordering::Relaxed);
             }
-            return Err(e);
+            return Err(if is_patch { Fail::Delta(e) } else { fail(e) });
         }
     };
     fs::rename(&tmp, live_path(inner))?;
@@ -560,7 +811,13 @@ async fn sync_once(
         Some(c) => c.swap_map(map)?,
         None => *client = Some(AttosClient::new(map, inner.cfg.open)),
     }
-    info!("hot-swapped dataset {} ({} bytes)", inner.cfg.dataset_id, written);
+    info!("hot-swapped dataset {} ({} bytes{})", inner.cfg.dataset_id, written, if is_patch { ", patch" } else { "" });
+    if is_patch {
+        inner.delta_applied.fetch_add(1, Ordering::Relaxed);
+    }
+    if redirected {
+        inner.redirected.fetch_add(1, Ordering::Relaxed);
+    }
     let ep = etag_path(inner);
     match &new_etag {
         Some(e) => {
@@ -588,6 +845,38 @@ async fn sync_once(
         *inner.dataset_name.lock().unwrap() = name;
     }
     Ok(SyncOutcome::Updated)
+}
+
+/// Rebuilds the new blob into `dst` from the live file and the downloaded patch (`patch_path`). The patch's
+/// base tag must be the tag this node holds, and its target SHA-256 must match the server's header.
+fn rebuild_from_patch(
+    inner: &Inner,
+    headers: &reqwest::header::HeaderMap,
+    patch_path: &std::path::Path,
+    dst: &std::path::Path,
+) -> Result<(), AttosError> {
+    let mut have = inner.etag.lock().unwrap().clone().unwrap_or_default();
+    if let Some(raw) = have.strip_suffix("-gzip\"") { // the raw tag of the same version
+        have = format!("{}\"", raw);
+    }
+    let base_tag = hv(headers, "x-attos-delta-base-etag").unwrap_or_default();
+    if base_tag != have {
+        return Err(AttosError::Transport(format!("patch is for base {}, this node has {}", base_tag, have)));
+    }
+    let live = fs::File::open(live_path(inner))?;
+    // SAFETY: the live file is replaced only by an atomic rename of a fresh file, never written in place.
+    let base = unsafe { memmap2::Mmap::map(&live) }?;
+    let patch = fs::File::open(patch_path)?;
+    let mut w = std::io::BufWriter::with_capacity(1 << 16, fs::File::create(dst)?);
+    let sha = crate::delta::apply_delta(&mut w, &base, patch)?;
+    w.flush()?;
+    w.into_inner().map_err(|e| AttosError::IoError(e.into_error()))?.sync_all()?;
+    if let Some(want) = hv(headers, "x-attos-delta-target-sha256") {
+        if !want.is_empty() && crate::sha256::hex(&sha) != want.to_ascii_lowercase() {
+            return Err(crate::delta::corrupt("target SHA-256 differs from the server's header"));
+        }
+    }
+    Ok(())
 }
 
 /// Snapshot the window and enqueue (drop-newest on a full queue).

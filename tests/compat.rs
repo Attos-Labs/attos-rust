@@ -22,7 +22,7 @@ fn open_patched(name: &str, fix_crc: bool, mutate: impl Fn(&mut Vec<u8>)) -> Res
 fn unsupported_features_fail_closed() {
     type M = fn(&mut Vec<u8>);
     let cases: [(&str, M); 3] = [
-        ("flags", |d| d[8] |= 4),
+        ("flags", |d| d[8] |= 8), // 0x04 is the overflow flag
         ("offset width 6", |d| d[52] = 6),
         ("fingerprint width 16", |d| {
             d[8] |= 2;

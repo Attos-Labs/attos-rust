@@ -185,6 +185,8 @@ pub(crate) struct V2Params {
     pub(crate) block_shift: u32,
     /// flags bit 1: fingerprint width (4 or 8) when records store `fingerprint | value`, else 0.
     pub(crate) lean_w: usize,
+    /// flags bit 2: an overflow block sits between the main blob and the CRC trailer.
+    pub(crate) overflow: bool,
 }
 
 impl V2Params {
@@ -227,8 +229,8 @@ impl V2Params {
         let bsz = packed_size(nb - p2, bw).ok_or_else(|| bad("v2 back section overflow"))?;
         let free = ((m - n) * 4).div_ceil(8) * 8;
         let flags = d[8];
-        if flags & !3 != 0 {
-            return Err(unsupported(format!("flags {:#04x} (unknown bits {:#04x})", flags, flags & !3), "unsupported v2 flags"));
+        if flags & !7 != 0 {
+            return Err(unsupported(format!("flags {:#04x} (unknown bits {:#04x})", flags, flags & !7), "unsupported v2 flags"));
         }
         let compressed = flags & 1 != 0;
         let mut lean_w = 0usize;
@@ -280,6 +282,7 @@ impl V2Params {
             compressed,
             block_shift,
             lean_w,
+            overflow: flags & 4 != 0,
         })
     }
 }

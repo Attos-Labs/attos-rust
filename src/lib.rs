@@ -1,7 +1,11 @@
 //! Attos Rust SDK: memory-mapped v1 blob reader with lock-free hot-swap,
 //! background sync (CONTRACTS.md §4) and telemetry (CONTRACTS.md §5).
 pub mod error;
+mod delta;
 pub mod map;
+mod overflow;
+pub mod redirect;
+mod sha256;
 mod stats;
 pub mod sync;
 pub mod synchronizer;

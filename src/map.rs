@@ -4,6 +4,7 @@ use std::fs::File;
 use std::hash::Hasher;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use twox_hash::XxHash64;
 
@@ -11,6 +12,7 @@ use crc32fast::Hasher as Crc32Hasher;
 use tracing::{debug, info, instrument, warn};
 
 use crate::error::AttosError;
+use crate::overflow::{Overflow, Probe};
 use crate::stats::LatencyHistogram;
 use crate::v2::{key_fingerprint, lz4_decompress, next_record, read_offset, uvarint, get_bits, V2Params, MAX_BLOCK_RAW};
 pub use crate::v2::{pthash_hp, pthash_mix, pthash_reduce};
@@ -72,6 +74,9 @@ pub struct AttosMap {
     pinned: bool,
     closed: bool,
     v2: Option<V2Params>,
+    /// Overflow block (flags bit 2), parsed and validated at open.
+    ov: Option<Overflow>,
+    rows: OnceLock<usize>,
     // Telemetry: striped lookup counters (indexed by key hash, so concurrent
     // readers rarely share a cache line) and a 1/256-sampled latency histogram.
     lookups: [Stripe; STRIPES],
@@ -250,6 +255,10 @@ impl AttosMap {
         } else {
             None
         };
+        let ov = match &v2 {
+            Some(p) if p.overflow => Some(Overflow::parse(&mmap, (p.blob_off + p.blob_len) as u64)?),
+            _ => None,
+        };
         let layout = match &v2 {
             Some(p) => Layout {
                 is_32bit: false,
@@ -320,6 +329,8 @@ impl AttosMap {
             pinned,
             closed: false,
             v2,
+            ov,
+            rows: OnceLock::new(),
             lookups: Default::default(),
             latency: LatencyHistogram::default(),
         })
@@ -346,6 +357,8 @@ impl AttosMap {
             pinned: false,
             closed: true,
             v2: None,
+            ov: None,
+            rows: OnceLock::new(),
             lookups: Default::default(),
             latency: LatencyHistogram::default(),
         }
@@ -370,6 +383,9 @@ impl AttosMap {
         if self.closed {
             return 0;
         }
+        if self.ov.is_some() {
+            return *self.rows.get_or_init(|| self.count_rows_overflow());
+        }
         if self.v2.is_some() {
             return self.total_keys as usize;
         }
@@ -390,6 +406,20 @@ impl AttosMap {
 
     #[inline(always)]
     fn entry(&self, h: u64, key: &[u8]) -> Result<&[u8], AttosError> {
+        // Overflow first: a value or tombstone there decides the answer; a miss continues with the same hash.
+        if let Some(ov) = &self.ov {
+            match ov.probe(&self.mmap, h, key) {
+                Probe::Value(v) => return Ok(v),
+                Probe::Tombstone => return Err(AttosError::KeyNotFound),
+                Probe::Miss => {}
+            }
+        }
+        self.entry_main(h, key)
+    }
+
+    /// The main-table lookup, ignoring the overflow block.
+    #[inline(always)]
+    fn entry_main(&self, h: u64, key: &[u8]) -> Result<&[u8], AttosError> {
         if let Some(p) = &self.v2 {
             if p.compressed {
                 return Err(AttosError::CompressedRequiresOwned);
@@ -496,6 +526,33 @@ impl AttosMap {
         F: FnMut(&[u8], &[u8]) -> bool,
     {
         if self.closed {
+            return;
+        }
+        if let (Some(p), Some(ov)) = (&self.v2, &self.ov) {
+            // Main entries the overflow overrides or deletes are skipped, then the live overflow entries
+            // follow. Lean-key files hold fingerprints, which cannot be masked (Scan reports them as is).
+            let lean = p.lean_w != 0;
+            let mut stopped = false;
+            self.scan_v2(p, &mut |k: &[u8], v: &[u8]| {
+                if !lean && !matches!(ov.probe(&self.mmap, hash_key(k), k), Probe::Miss) {
+                    return true;
+                }
+                if callback(k, v) {
+                    true
+                } else {
+                    stopped = true;
+                    false
+                }
+            });
+            if !stopped {
+                for i in 0..ov.len() {
+                    if let Some((k, v, false)) = ov.entry(&self.mmap, i) {
+                        if !callback(k, v) {
+                            break;
+                        }
+                    }
+                }
+            }
             return;
         }
         if let Some(p) = &self.v2 {
@@ -644,6 +701,17 @@ impl AttosMap {
         };
         let h = hash_key(key);
         self.lookups[(h as usize) & (STRIPES - 1)].0.fetch_add(1, Ordering::Relaxed);
+        if let Some(ov) = &self.ov {
+            match ov.probe(&self.mmap, h, key) {
+                Probe::Value(v) => return Ok(Cow::Borrowed(v)),
+                Probe::Tombstone => return Err(AttosError::KeyNotFound),
+                Probe::Miss => {}
+            }
+        }
+        self.main_cow(p, h, key)
+    }
+
+    fn main_cow<'a>(&'a self, p: &V2Params, h: u64, key: &[u8]) -> Result<Cow<'a, [u8]>, AttosError> {
         let slot = self.v2_slot(p, h)?;
         let blk = self.v2_block(p, slot >> p.block_shift)?;
         let raw = Self::decode_block(blk)?;
@@ -665,6 +733,29 @@ impl AttosMap {
             Cow::Borrowed(b) => Cow::Borrowed(&b[value_range]),
             Cow::Owned(v) => Cow::Owned(v[value_range].to_vec()),
         })
+    }
+
+    /// Whether the main table (ignoring the overflow) maps `key` to a record.
+    fn main_has(&self, h: u64, key: &[u8]) -> bool {
+        match &self.v2 {
+            Some(p) if p.compressed => self.main_cow(p, h, key).is_ok(),
+            _ => self.entry_main(h, key).is_ok(),
+        }
+    }
+
+    /// Live keys of a file with an overflow: main keys, plus new overflow keys, minus tombstoned main keys.
+    fn count_rows_overflow(&self) -> usize {
+        let Some(ov) = &self.ov else { return self.total_keys as usize };
+        let mut n = self.total_keys as usize;
+        for i in 0..ov.len() {
+            let Some((k, _, tomb)) = ov.entry(&self.mmap, i) else { continue };
+            match (tomb, self.main_has(hash_key(k), k)) {
+                (true, true) => n -= 1,
+                (false, false) => n += 1,
+                _ => {}
+            }
+        }
+        n
     }
 
     /// Lookup returning an owned copy of the value; works for every file kind.
