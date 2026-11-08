@@ -1,0 +1,9 @@
+seed_b64=BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=
+pub_b64=6kpsY+KcUgq+9VB7Ey7F+ZVHdq6+vnuSQh7qaRRG0iw=
+pub_url_nopad=6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw
+kid=k1
+dataset=ds-1
+file=v2_expected.attos
+digest_hex=3f1d70c6fe07303e162d50266ceb2c6d292df1c54227016114520bef216164ab
+header=alg=ed25519; kid=k1; sig=nlSygdFHnlLqkK8AljY+ggUyFne97RgAFE7V2HN726v9hmBZmQaav5QYAp6walbSLz/t5AeltogELG5H36MfCg==
+header_other_dataset=alg=ed25519; kid=k1; sig=gRO7KjXt+z0mLb0XTigvvYIH+5bxYCLfQCxJncK1ICaRXSCnMHW1c7wOCdYsoO6Oxi6Bc9Xer15gdYDKA/EkDA==

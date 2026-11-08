@@ -2,7 +2,7 @@
 //! server, including fault injection: truncated body, connection killed
 //! mid-download, corrupted CRC, unknown version, 402/429/500/404.
 mod common;
-use attos_client::synchronizer::{next_delay, transient_backoff, MAX_RETRY_AFTER, QUOTA_PAUSE};
+use attos_client::synchronizer::{jitter_interval, next_delay, next_delay_with, transient_backoff, MAX_RETRY_AFTER, QUOTA_PAUSE};
 use attos_client::{AttosError, AttosSynchronizer, SyncConfig, SyncOutcome};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -233,19 +233,39 @@ fn backoff_policy() {
     let mut f = 0;
     let mut logged = HashSet::new();
     let q = |c, ra| Err(AttosError::HttpStatus { code: c, retry_after: ra });
-    assert_eq!(next_delay(&q(402, None), &mut f, i, b, &mut logged), QUOTA_PAUSE);
-    assert_eq!(next_delay(&q(429, Some(Duration::from_secs(90))), &mut f, i, b, &mut logged), Duration::from_secs(90));
-    assert_eq!(next_delay(&q(429, Some(Duration::from_secs(99999))), &mut f, i, b, &mut logged), MAX_RETRY_AFTER);
+    // Quota pauses are never shorter than asked and stretched by at most 20 %.
+    let within = |d: Duration, lo: Duration, hi: Duration| d >= lo && d <= hi.mul_f64(1.0 + 1e-9);
+    let d = next_delay(&q(402, None), &mut f, i, b, &mut logged);
+    assert!(within(d, QUOTA_PAUSE, QUOTA_PAUSE.mul_f64(1.2)), "{:?}", d);
+    let ra = Duration::from_secs(90);
+    let d = next_delay(&q(429, Some(ra)), &mut f, i, b, &mut logged);
+    assert!(within(d, ra, ra.mul_f64(1.2)), "{:?}", d);
+    let d = next_delay(&q(429, Some(Duration::from_secs(99999))), &mut f, i, b, &mut logged);
+    assert!(within(d, MAX_RETRY_AFTER, MAX_RETRY_AFTER.mul_f64(1.2)), "{:?}", d);
+    // 4xx and success: the interval plus up to half of it.
     for c in [400, 401, 403, 404, 409] {
-        assert_eq!(next_delay(&q(c, None), &mut f, i, b, &mut logged), i);
+        let d = next_delay(&q(c, None), &mut f, i, b, &mut logged);
+        assert!(within(d, i, i.mul_f64(1.5)), "{} {:?}", c, d);
     }
     for k in 0..8u32 {
         let d = next_delay(&q(503, None), &mut f, i, b, &mut logged);
         let base = (b * (1 << k)).min(i);
         assert!(d >= base.mul_f64(0.8) && d <= base.mul_f64(1.2), "k={} d={:?}", k, d);
     }
-    assert_eq!(next_delay(&Ok(SyncOutcome::Updated), &mut f, i, b, &mut logged), i);
+    let d = next_delay(&Ok(SyncOutcome::Updated), &mut f, i, b, &mut logged);
+    assert!(within(d, i, i.mul_f64(1.5)), "{:?}", d);
     assert_eq!(f, 0);
+    // Deterministic draws: r = 0 → exactly the base value, r → 1 → the upper bound.
+    let ok = Ok(SyncOutcome::Updated);
+    assert_eq!(next_delay_with(&ok, &mut f, i, b, &mut logged, 0.0, 0.0), i);
+    assert_eq!(next_delay_with(&ok, &mut f, i, b, &mut logged, 0.5, 0.0), i + i / 4);
+    assert_eq!(jitter_interval(Duration::from_secs(30), 0.999999), Duration::from_secs_f64(30.0 + 15.0 * 0.999999));
+    assert_eq!(jitter_interval(Duration::ZERO, 0.9), Duration::ZERO, "polling off stays off");
+    assert_eq!(next_delay_with(&q(402, None), &mut f, i, b, &mut logged, 0.5, 0.0), QUOTA_PAUSE.mul_f64(1.1));
+    // The jitter is spread: 200 draws are not all equal and all inside [i, 1.5 i).
+    let ds: Vec<Duration> = (0..200).map(|_| next_delay(&ok, &mut f, i, b, &mut logged)).collect();
+    assert!(ds.iter().all(|d| *d >= i && *d < i.mul_f64(1.5)));
+    assert!(ds.iter().any(|d| *d != ds[0]), "no jitter");
     assert!(transient_backoff(30, Duration::from_secs(3600), b) <= Duration::from_secs(360));
 }
 

@@ -308,3 +308,78 @@ fn damaged_patch_falls_back_to_the_full_file() {
     assert!(!last.get("x-attos-capabilities").map_or(false, |c| c.contains("overflow")));
     assert!(is_sync(&r[0].0));
 }
+
+fn signed_header(seed: u8, bytes: &[u8]) -> String {
+    attos_client::sign_artifact(&[seed; 32], "k1", "ds-1", &attos_client::sha256_digest(bytes))
+}
+
+fn signed_cfg(url: &str, dir: &std::path::Path) -> SyncConfig {
+    let mut c = cfg(url, dir);
+    c.signature_keys.insert("k1".into(), attos_client::public_key_for(&[7; 32]));
+    c
+}
+
+/// With signing enforced, the signature covers the rebuilt file: a patch is accepted when the target verifies.
+#[test]
+fn signed_tail_patch_is_verified_on_the_rebuilt_file() {
+    let (base, expected, patch) = (fx("v1_base.attos"), fx("v2_expected.attos"), fx("v1_to_v2_tail.patch"));
+    for good in [true, false] {
+        let (b, e, p) = (base.clone(), expected.clone(), patch.clone());
+        let (sig_base, sig_exp) = (signed_header(7, &base), signed_header(if good { 7 } else { 9 }, &expected));
+        let api = serve(Box::new(move |_, q| {
+            let inm = q.get("if-none-match").map(String::as_str);
+            if inm != Some("\"v1\"") {
+                return if inm.is_some() {
+                    (200, vec![h("ETag", "\"v2\""), h("X-Attos-Signature", &sig_exp)], e.clone())
+                } else {
+                    (200, vec![h("ETag", "\"v1\""), h("X-Attos-Signature", &sig_base)], b.clone())
+                };
+            }
+            if q.get("x-attos-capabilities").map_or(false, |c| c.contains("overflow")) {
+                return (200, vec![h("X-Attos-Delta", "1"), h("X-Attos-Delta-Base-ETag", "\"v1\""), h("ETag", "\"v2\""), h("X-Attos-Signature", &sig_exp)], p.clone());
+            }
+            (200, vec![h("ETag", "\"v2\""), h("X-Attos-Signature", &sig_exp)], e.clone())
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        let s = AttosSynchronizer::start(signed_cfg(&format!("http://{}", api.addr), dir.path())).unwrap();
+        if good {
+            assert_eq!(s.sync_now().unwrap(), SyncOutcome::Updated);
+            assert_eq!(val(&s, "ins_0").unwrap(), "inserted_0");
+            assert_eq!(s.delta_stats(), (1, 0));
+            assert_eq!(s.signature_errors(), 0);
+        } else {
+            // patch rebuilds fine but its signature is wrong → patch fails, full blob fails too, v1 keeps serving
+            assert!(matches!(s.sync_now(), Err(AttosError::SignatureInvalid(_))));
+            assert_eq!(val(&s, "key_10").unwrap(), "val_10");
+            assert!(val(&s, "ins_0").is_err());
+            assert_eq!(s.signature_errors(), 2);
+        }
+    }
+}
+
+/// The signature header of a signed redirect comes from the 302 and covers the downloaded bytes.
+#[test]
+fn signed_redirect_download_is_verified() {
+    let blob = fx("v2_expected.attos");
+    for good in [true, false] {
+        let b = blob.clone();
+        let store = serve(Box::new(move |_, _| (200, vec![], b.clone())));
+        let (loc, n) = (format!("http://{}/o", store.addr), blob.len());
+        let sig = signed_header(7, &blob);
+        let b2 = blob.clone();
+        let api = serve(Box::new(move |_, q| {
+            if q.contains_key("x-attos-no-redirect") {
+                return (200, vec![h("ETag", "\"v2\""), h("X-Attos-Signature", &sig)], b2.clone());
+            }
+            let s = if good { sig.clone() } else { sig.replace("sig=", "sig=AAAA") };
+            (302, vec![h("Location", &loc), h("X-Attos-Content-Length", &n.to_string()), h("ETag", "\"v2\""), h("X-Attos-Signature", &s)], vec![])
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = signed_cfg(&format!("http://{}", api.addr), dir.path());
+        c.test_redirect_any_target = true;
+        let s = AttosSynchronizer::start(c).unwrap();
+        assert_eq!(val(&s, "ins_2").unwrap(), "inserted_2");
+        // good: taken from the signed URL; bad signature on the 302 → redirect failure → one fallback through the endpoint
+        assert_eq!(s.redirect_stats(), if good { (1, 0) } else { (0, 1) });
+    }
+}

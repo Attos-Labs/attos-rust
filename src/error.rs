@@ -12,6 +12,10 @@ pub enum AttosError {
     UnsupportedFeature(String),
     ChecksumMismatch { expected: u32, actual: u32 },
     MapClosed,
+    /// Signing is enforced but the response (or the cache) carried no signature.
+    SignatureMissing,
+    /// The signature is malformed, names an unknown key or does not verify.
+    SignatureInvalid(String),
     /// The file stores compressed blocks; use `get_cow` / `get_owned` instead of the zero-copy API.
     CompressedRequiresOwned,
     MlockFailed(io::Error),
@@ -55,6 +59,8 @@ impl fmt::Display for AttosError {
                 write!(f, "checksum mismatch: trailer {:#010x}, computed {:#010x}", expected, actual)
             }
             AttosError::MapClosed => write!(f, "map closed"),
+            AttosError::SignatureMissing => write!(f, "dataset signature missing"),
+            AttosError::SignatureInvalid(m) => write!(f, "dataset signature invalid: {}", m),
             AttosError::CompressedRequiresOwned => {
                 write!(f, "file uses compressed blocks: use get_cow/get_owned")
             }

@@ -13,7 +13,7 @@ use crate::telemetry::{
     TELEMETRY_429_PAUSE, TELEMETRY_QUEUE,
 };
 use std::collections::hash_map::RandomState;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{BuildHasher, Hasher};
 use std::io::Write;
@@ -77,6 +77,10 @@ pub struct SyncConfig {
     pub redirect_cooldown: Duration,
     /// Tests against local servers only: lifts the redirect host policy (http, IP literals, any host).
     pub test_redirect_any_target: bool,
+    /// Trusted Ed25519 public keys by key id (see [`crate::signature`]). When non-empty, signed artifacts are
+    /// enforced: only files whose `X-Attos-Signature` verifies against one of these keys are installed or served
+    /// from the cache (fail closed). Decode keys with [`crate::parse_public_key`].
+    pub signature_keys: HashMap<String, [u8; 32]>,
 }
 
 impl SyncConfig {
@@ -101,6 +105,7 @@ impl SyncConfig {
             redirect_hosts: Vec::new(),
             redirect_cooldown: Duration::from_secs(3600),
             test_redirect_any_target: false,
+            signature_keys: HashMap::new(),
         }
     }
 }
@@ -132,6 +137,7 @@ struct Inner {
     delta_fallbacks: AtomicU64,
     redirected: AtomicU64,
     redirect_fallbacks: AtomicU64,
+    sig_errors: AtomicU64,
 }
 
 /// Background synchronizer: download → fsync → validate → rename → mmap →
@@ -191,16 +197,35 @@ pub fn uuid_v4() -> String {
 
 /// Exponential back-off 1 s·2^k with ±20 % jitter, capped at min(interval, 5 min).
 pub fn transient_backoff(k: u32, interval: Duration, base: Duration) -> Duration {
+    transient_backoff_with(k, interval, base, random())
+}
+
+/// [`transient_backoff`] with the jitter draw `r` in `[0, 1)` supplied by the caller.
+pub fn transient_backoff_with(k: u32, interval: Duration, base: Duration, r: f64) -> Duration {
     let mut cap = MAX_TRANSIENT_BACKOFF;
     if !interval.is_zero() && interval < cap {
         cap = interval;
     }
     let d = base.saturating_mul(1u32 << k.min(20)).min(cap);
-    let r = (RandomState::new().build_hasher().finish() % 10_000) as f64 / 10_000.0;
     d.mul_f64(0.8 + 0.4 * r)
 }
 
-/// Policy: delay before the next poll after an attempt's outcome.
+/// A draw in `[0, 1)` from the OS-seeded std hasher.
+fn random() -> f64 {
+    (RandomState::new().build_hasher().finish() >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// The wait between polls: the base interval plus a random share of up to half of it ("30 s + up to 15 s"),
+/// so a fleet that reconnects together does not poll in lockstep. An interval of 0 (polling off) stays 0.
+/// `r` is a draw in `[0, 1)`.
+pub fn jitter_interval(interval: Duration, r: f64) -> Duration {
+    if interval.is_zero() {
+        return interval;
+    }
+    interval + (interval / 2).mul_f64(r)
+}
+
+/// Policy: delay before the next poll after an attempt's outcome (jittered with a fresh random draw).
 pub fn next_delay(
     res: &Result<SyncOutcome, AttosError>,
     failures: &mut u32,
@@ -208,13 +233,29 @@ pub fn next_delay(
     base: Duration,
     logged: &mut HashSet<u16>,
 ) -> Duration {
+    next_delay_with(res, failures, interval, base, logged, random(), random())
+}
+
+/// [`next_delay`] with the random draws (`r1` for the poll/pause jitter, `r2` for the transient back-off, both in
+/// `[0, 1)`) supplied by the caller. Success and 4xx wait `interval + up to 50 %`; a 402/429 pause is stretched by
+/// up to 20 % ("resume at spread-out moments, never earlier than asked"); transient errors back off 1 s·2^k ±20 %.
+pub fn next_delay_with(
+    res: &Result<SyncOutcome, AttosError>,
+    failures: &mut u32,
+    interval: Duration,
+    base: Duration,
+    logged: &mut HashSet<u16>,
+    r1: f64,
+    r2: f64,
+) -> Duration {
     match res {
         Ok(_) => {
             *failures = 0;
-            interval
+            jitter_interval(interval, r1)
         }
         Err(AttosError::HttpStatus { code, retry_after }) if *code == 402 || *code == 429 => {
             let d = retry_after.map(|d| d.min(MAX_RETRY_AFTER)).unwrap_or(QUOTA_PAUSE);
+            let d = d + d.mul_f64(0.2 * r1);
             warn!("quota/node limit ({}); sync paused for {:?}, serving local data", code, d);
             d
         }
@@ -223,10 +264,10 @@ pub fn next_delay(
                 warn!("sync rejected with HTTP {}; keeping current data", code);
             }
             *failures = 0;
-            interval
+            jitter_interval(interval, r1)
         }
         Err(e) => {
-            let d = transient_backoff(*failures, interval, base);
+            let d = transient_backoff_with(*failures, interval, base, r2);
             *failures += 1;
             warn!("sync failed ({}); keeping current data, retrying in {:?}", e, d);
             d
@@ -271,6 +312,7 @@ impl AttosSynchronizer {
             delta_fallbacks: AtomicU64::new(0),
             redirected: AtomicU64::new(0),
             redirect_fallbacks: AtomicU64::new(0),
+            sig_errors: AtomicU64::new(0),
         });
         remove_stale_temps(&inner);
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -341,6 +383,10 @@ impl AttosSynchronizer {
     }
     pub fn crc_errors(&self) -> u64 {
         self.inner.crc_errors.load(Ordering::Relaxed)
+    }
+    /// Downloaded or cached files rejected by signature verification.
+    pub fn signature_errors(&self) -> u64 {
+        self.inner.sig_errors.load(Ordering::Relaxed)
     }
     /// `(applied, fallbacks)`: syncs completed from a patch, and patches that failed and fell back to a full blob.
     pub fn delta_stats(&self) -> (u64, u64) {
@@ -417,7 +463,15 @@ async fn run(
     let mut client: Option<AttosClient> = None;
     let live = live_path(&inner);
     if live.exists() {
-        match AttosMap::open_inner(&live, inner.cfg.open, true) {
+        // With signing enforced the cached file is re-verified against the signature saved with it.
+        let cached = match verify_cached(&inner, &live) {
+            Ok(()) => AttosMap::open_inner(&live, inner.cfg.open, true),
+            Err(e) => {
+                inner.sig_errors.fetch_add(1, Ordering::Relaxed);
+                Err(e)
+            }
+        };
+        match cached {
             Ok(m) => {
                 client = Some(AttosClient::new(m, inner.cfg.open));
                 *inner.etag.lock().unwrap() = fs::read_to_string(etag_path(&inner)).ok();
@@ -792,6 +846,14 @@ async fn sync_attempt(
         drop(patch_guard);
     }
 
+    // Signed artifacts: the signature covers the SHA-256 of the complete plain file, however it arrived.
+    if !inner.cfg.signature_keys.is_empty() {
+        let sig = hv(&eff.headers, "x-attos-signature");
+        if let Err(e) = file_digest(&tmp).and_then(|d| crate::signature::verify(&inner.cfg.signature_keys, &inner.cfg.dataset_id, sig.as_deref(), &d)) {
+            inner.sig_errors.fetch_add(1, Ordering::Relaxed);
+            return Err(if is_patch { Fail::Delta(e) } else { fail(e) });
+        }
+    }
     // Validate the complete file (magic, version, flag, sizes, CRC) before it can become visible.
     let map = match AttosMap::open_inner(&tmp, inner.cfg.open, true) {
         Ok(m) => m,
@@ -804,6 +866,9 @@ async fn sync_attempt(
     };
     fs::rename(&tmp, live_path(inner))?;
     guard.0 = None;
+    if !inner.cfg.signature_keys.is_empty() {
+        write_sig(inner, hv(&eff.headers, "x-attos-signature").as_deref().unwrap_or(""));
+    }
     if let Ok(d) = fs::File::open(&inner.cfg.cache_dir) {
         let _ = d.sync_all();
     }
@@ -845,6 +910,50 @@ async fn sync_attempt(
         *inner.dataset_name.lock().unwrap() = name;
     }
     Ok(SyncOutcome::Updated)
+}
+
+fn sig_path(i: &Inner) -> PathBuf {
+    let mut p = live_path(i).into_os_string();
+    p.push(".sig");
+    PathBuf::from(p)
+}
+
+fn write_sig(i: &Inner, header: &str) {
+    use std::io::Write as _;
+    let mut o = fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    if let Err(e) = o.open(sig_path(i)).and_then(|mut f| f.write_all(header.as_bytes())) {
+        warn!("could not persist signature: {}", e);
+    }
+}
+
+/// SHA-256 of a whole file.
+fn file_digest(p: &std::path::Path) -> Result<[u8; 32], AttosError> {
+    use std::io::Read;
+    let mut f = fs::File::open(p)?;
+    let mut h = crate::sha256::Sha256::new();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            return Ok(h.finish());
+        }
+        h.update(&buf[..n]);
+    }
+}
+
+/// Re-checks the cached live file against the signature saved with it (no-op without enforced signing).
+fn verify_cached(i: &Inner, live: &std::path::Path) -> Result<(), AttosError> {
+    if i.cfg.signature_keys.is_empty() {
+        return Ok(());
+    }
+    let hdr = fs::read_to_string(sig_path(i)).map_err(|_| AttosError::SignatureMissing)?;
+    crate::signature::verify(&i.cfg.signature_keys, &i.cfg.dataset_id, Some(hdr.trim()), &file_digest(live)?)
 }
 
 /// Rebuilds the new blob into `dst` from the live file and the downloaded patch (`patch_path`). The patch's

@@ -5,6 +5,7 @@ mod delta;
 pub mod map;
 mod overflow;
 pub mod redirect;
+pub mod signature;
 mod sha256;
 mod stats;
 pub mod sync;
@@ -15,6 +16,7 @@ pub mod telemetry;
 pub use error::AttosError;
 pub use map::{AttosMap, OpenConfig};
 pub use stats::LatencySnapshot;
+pub use signature::{parse_public_key, public_key_for, sha256_digest, sign_artifact, SIGNATURE_HEADER};
 pub use sync::AttosClient;
 pub use synchronizer::{AttosSynchronizer, SyncConfig, SyncOutcome};
 
