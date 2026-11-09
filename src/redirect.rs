@@ -10,7 +10,8 @@ use reqwest::Url;
 /// Environment variable listing extra download hosts, comma separated.
 pub const REDIRECT_HOSTS_ENV: &str = "ATTOS_REDIRECT_HOSTS";
 
-const DEFAULT_HOSTS: [&str; 2] = ["storage.googleapis.com", "*.storage.googleapis.com"];
+/// Google Cloud Storage (path-style and virtual-hosted) and the Attos download CDN (exact host).
+const DEFAULT_HOSTS: [&str; 3] = ["storage.googleapis.com", "*.storage.googleapis.com", "dl.attoscloud.com"];
 
 #[derive(Debug, Clone)]
 pub(crate) struct RedirectPolicy {
@@ -144,6 +145,7 @@ mod tests {
             "https://STORAGE.GOOGLEAPIS.COM/bkt/obj",
             "https://storage.googleapis.com:443/bkt/obj",
             "https://my-bucket.storage.googleapis.com/obj?x=1",
+            "https://dl.attoscloud.com/o/datasets/abc/d.v2.attos/1699999999123456?exp=1800000300&sig=abc",
             "https://dl.example.com/o/abc",
             "https://edge.cdn.example.net/o/abc",
             "https://a.b.cdn.example.net/o/abc",
@@ -172,6 +174,10 @@ mod tests {
             "https://storage.googleapis.com/b/o#frag",
             "https://st\u{43e}rage.googleapis.com/b/o",
             "https://googleapis.com/b/o",
+            "https://evildl.attoscloud.com/o",
+            "https://x.dl.attoscloud.com/o",
+            "https://attoscloud.com/o",
+            "http://dl.attoscloud.com/o",
             "https://example.com/b/o",
             "https://cdn.example.net/o",
             "https://x.com/o",
