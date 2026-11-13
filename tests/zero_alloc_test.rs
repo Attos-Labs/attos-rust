@@ -13,7 +13,9 @@ fn lookup_path_allocates_nothing() {
     std::fs::write(&p0, common::gen_blob(0)).unwrap();
     std::fs::write(&p1, common::gen_blob(1)).unwrap();
     let client = AttosClient::new(AttosMap::open(&p0).unwrap(), OpenConfig::default());
-    let keys: Vec<Vec<u8>> = (0..common::GEN_KEYS).map(|i| format!("key_{}", i).into_bytes()).collect();
+    let keys: Vec<Vec<u8>> = (0..common::GEN_KEYS)
+        .map(|i| format!("key_{}", i).into_bytes())
+        .collect();
     let mut dst = Vec::with_capacity(256);
     // Warm up thread-local arc-swap debt slots before measuring.
     let _ = client.read().get(&keys[0]);
@@ -39,5 +41,8 @@ fn lookup_path_allocates_nothing() {
         }
     });
     assert_eq!(info.count_total, 0, "after swap: {:?}", info);
-    println!("0 allocations over {} lookups", keys.len() * 20 * 4 + keys.len());
+    println!(
+        "0 allocations over {} lookups",
+        keys.len() * 20 * 4 + keys.len()
+    );
 }

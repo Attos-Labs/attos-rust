@@ -1,3 +1,4 @@
+#![allow(clippy::single_match)]
 use attos_client::AttosMap;
 use std::env;
 use std::io::{Read, Write};
@@ -71,8 +72,14 @@ fn main() {
 
 fn do_lookup(map: &AttosMap, key: &str, print: bool) -> String {
     let result = match map.get_string(key) {
-        Ok(v) => format!(r#"{{"key": "{}", "value": "{}", "status": "found"}}"#, key, v),
-        Err(_) => format!(r#"{{"key": "{}", "value": null, "status": "not_found"}}"#, key),
+        Ok(v) => format!(
+            r#"{{"key": "{}", "value": "{}", "status": "found"}}"#,
+            key, v
+        ),
+        Err(_) => format!(
+            r#"{{"key": "{}", "value": null, "status": "not_found"}}"#,
+            key
+        ),
     };
     if print {
         println!("{}", result);

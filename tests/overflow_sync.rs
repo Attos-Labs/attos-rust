@@ -1,3 +1,4 @@
+#![allow(clippy::unnecessary_map_or)] // is_none_or needs a newer MSRV
 //! Overflow capability, signed redirects and tail patches against local fake servers: the capability header,
 //! credential-free signed downloads, the redirect host allowlist, the redirect cool-down, ordinary redirects
 //! across hosts, ATDL v2 tail patches and the full-blob fallback.
@@ -43,7 +44,11 @@ fn serve(mut h: Handler) -> Srv {
             let (code, hs, body) = h(&path, &hdr);
             log.lock().unwrap().push((path, hdr));
             let mut out = TcpStream::try_clone(&s).unwrap();
-            let mut head = format!("HTTP/1.1 {} X\r\nConnection: close\r\nContent-Length: {}\r\n", code, body.len());
+            let mut head = format!(
+                "HTTP/1.1 {} X\r\nConnection: close\r\nContent-Length: {}\r\n",
+                code,
+                body.len()
+            );
             for (k, v) in hs {
                 head.push_str(&format!("{}: {}\r\n", k, v));
             }
@@ -58,7 +63,12 @@ fn serve(mut h: Handler) -> Srv {
 }
 
 fn fx(name: &str) -> Vec<u8> {
-    std::fs::read(format!("{}/tests/golden/overflow/{}", env!("CARGO_MANIFEST_DIR"), name)).unwrap()
+    std::fs::read(format!(
+        "{}/tests/golden/overflow/{}",
+        env!("CARGO_MANIFEST_DIR"),
+        name
+    ))
+    .unwrap()
 }
 
 fn cfg(url: &str, dir: &std::path::Path) -> SyncConfig {
@@ -76,7 +86,9 @@ fn h(k: &str, v: &str) -> (String, String) {
 
 fn val(s: &AttosSynchronizer, k: &str) -> Result<String, AttosError> {
     let mut d = Vec::new();
-    s.client().get_copy(k.as_bytes(), &mut d).map(|_| String::from_utf8(d).unwrap())
+    s.client()
+        .get_copy(k.as_bytes(), &mut d)
+        .map(|_| String::from_utf8(d).unwrap())
 }
 
 const SYNC: &str = "/api/v1/datasets/sync/ds-1";
@@ -88,12 +100,17 @@ fn is_sync(p: &str) -> bool {
 #[test]
 fn requests_advertise_overflow_and_redirect() {
     let base = fx("v1_base.attos");
-    let api = serve(Box::new(move |_, _| (200, vec![h("ETag", "\"v1\"")], base.clone())));
+    let api = serve(Box::new(move |_, _| {
+        (200, vec![h("ETag", "\"v1\"")], base.clone())
+    }));
     let dir = tempfile::tempdir().unwrap();
     let s = AttosSynchronizer::start(cfg(&format!("http://{}", api.addr), dir.path())).unwrap();
     let r = api.reqs.lock().unwrap();
     let q = &r[0].1;
-    assert_eq!(q.get("x-attos-capabilities").map(String::as_str), Some("overflow,redirect"));
+    assert_eq!(
+        q.get("x-attos-capabilities").map(String::as_str),
+        Some("overflow,redirect")
+    );
     assert_eq!(q.get("x-attos-accept-delta").map(String::as_str), Some("2"));
     assert!(q.get("x-attos-no-redirect").is_none());
     drop(r);
@@ -105,7 +122,11 @@ fn requests_advertise_overflow_and_redirect() {
     let _s2 = AttosSynchronizer::start(c).unwrap();
     let r = api.reqs.lock().unwrap();
     let q = &r.last().unwrap().1;
-    assert!(q.get("x-attos-capabilities").is_none() && q.get("x-attos-accept-delta").is_none() && q.get("x-attos-no-redirect").is_none());
+    assert!(
+        q.get("x-attos-capabilities").is_none()
+            && q.get("x-attos-accept-delta").is_none()
+            && q.get("x-attos-no-redirect").is_none()
+    );
     drop(s);
 }
 
@@ -116,7 +137,16 @@ fn signed_redirect_is_fetched_without_credentials() {
     let store = serve(Box::new(move |_, _| (200, vec![], blob.clone())));
     let loc = format!("http://{}/bkt/obj?X-Goog-Signature=abc", store.addr);
     let api = serve(Box::new(move |_, _| {
-        (302, vec![h("Location", &loc), h("X-Attos-Content-Length", &n.to_string()), h("ETag", "\"v2\""), h("X-Dataset-Name", "fake")], vec![])
+        (
+            302,
+            vec![
+                h("Location", &loc),
+                h("X-Attos-Content-Length", &n.to_string()),
+                h("ETag", "\"v2\""),
+                h("X-Dataset-Name", "fake"),
+            ],
+            vec![],
+        )
     }));
     let dir = tempfile::tempdir().unwrap();
     let mut c = cfg(&format!("http://{}", api.addr), dir.path());
@@ -127,10 +157,23 @@ fn signed_redirect_is_fetched_without_credentials() {
     assert_eq!(s.dataset_name().as_deref(), Some("fake"));
     assert_eq!(s.redirect_stats(), (1, 0));
     // The API server saw the credentials, the storage host saw none of them.
-    assert_eq!(api.reqs.lock().unwrap()[0].1.get("x-api-key").map(String::as_str), Some("test-key"));
+    assert_eq!(
+        api.reqs.lock().unwrap()[0]
+            .1
+            .get("x-api-key")
+            .map(String::as_str),
+        Some("test-key")
+    );
     let r = store.reqs.lock().unwrap();
     assert_eq!(r.len(), 1);
-    for k in ["x-api-key", "authorization", "x-attos-node-id", "cookie", "if-none-match", "x-attos-capabilities"] {
+    for k in [
+        "x-api-key",
+        "authorization",
+        "x-attos-node-id",
+        "cookie",
+        "if-none-match",
+        "x-attos-capabilities",
+    ] {
         assert!(!r[0].1.contains_key(k), "storage request carried {}", k);
     }
 }
@@ -142,11 +185,23 @@ fn redirect_to_a_host_outside_the_allowlist_is_refused_and_backs_off() {
     let evil = serve(Box::new(|_, _| (200, vec![], b"x".to_vec())));
     let (b2, evil_addr) = (blob.clone(), evil.addr.clone());
     let api = serve(Box::new(move |_, q| {
-        if q.get("x-attos-no-redirect").map(String::as_str) == Some("1") || !q.get("x-attos-capabilities").map_or(false, |c| c.contains("redirect")) {
+        if q.get("x-attos-no-redirect").map(String::as_str) == Some("1")
+            || !q
+                .get("x-attos-capabilities")
+                .map_or(false, |c| c.contains("redirect"))
+        {
             return (200, vec![h("ETag", "\"v2\"")], b2.clone());
         }
         let loc = format!("http://{}/bkt/obj", evil_addr);
-        (302, vec![h("Location", &loc), h("X-Attos-Content-Length", &n.to_string()), h("ETag", "\"v2\"")], vec![])
+        (
+            302,
+            vec![
+                h("Location", &loc),
+                h("X-Attos-Content-Length", &n.to_string()),
+                h("ETag", "\"v2\""),
+            ],
+            vec![],
+        )
     }));
     let dir = tempfile::tempdir().unwrap();
     let mut c = cfg(&format!("http://{}", api.addr), dir.path());
@@ -155,27 +210,53 @@ fn redirect_to_a_host_outside_the_allowlist_is_refused_and_backs_off() {
     // The first sync: redirect refused (http, loopback) → repeated through the endpoint with No-Redirect.
     assert_eq!(val(&s, "key_1").unwrap(), "val_1");
     assert_eq!(s.redirect_stats(), (0, 1));
-    assert_eq!(evil.reqs.lock().unwrap().len(), 0, "the refused host was contacted");
+    assert_eq!(
+        evil.reqs.lock().unwrap().len(),
+        0,
+        "the refused host was contacted"
+    );
     {
         let r = api.reqs.lock().unwrap();
         assert_eq!(r.len(), 2);
-        assert!(r[0].1.get("x-attos-capabilities").unwrap().contains("redirect"));
-        assert_eq!(r[1].1.get("x-attos-no-redirect").map(String::as_str), Some("1"));
-        assert!(!r[1].1.get("x-attos-capabilities").unwrap().contains("redirect"));
+        assert!(r[0]
+            .1
+            .get("x-attos-capabilities")
+            .unwrap()
+            .contains("redirect"));
+        assert_eq!(
+            r[1].1.get("x-attos-no-redirect").map(String::as_str),
+            Some("1")
+        );
+        assert!(!r[1]
+            .1
+            .get("x-attos-capabilities")
+            .unwrap()
+            .contains("redirect"));
     }
     // Back-off: while the cool-down runs, new syncs do not ask for a redirect at all.
     s.sync_now().unwrap();
     {
         let r = api.reqs.lock().unwrap();
         assert_eq!(r.len(), 3);
-        assert!(!r[2].1.get("x-attos-capabilities").unwrap().contains("redirect"));
-        assert_eq!(r[2].1.get("x-attos-no-redirect").map(String::as_str), Some("1"));
+        assert!(!r[2]
+            .1
+            .get("x-attos-capabilities")
+            .unwrap()
+            .contains("redirect"));
+        assert_eq!(
+            r[2].1.get("x-attos-no-redirect").map(String::as_str),
+            Some("1")
+        );
     }
     // After the cool-down the SDK asks again (and is refused again).
     std::thread::sleep(Duration::from_millis(700));
     s.sync_now().unwrap();
     let r = api.reqs.lock().unwrap();
-    assert!(r[3].1.get("x-attos-capabilities").unwrap().contains("redirect"));
+    assert!(r[3]
+        .1
+        .get("x-attos-capabilities")
+        .unwrap()
+        .contains("redirect"));
     assert_eq!(s.redirect_stats().1, 2);
 }
 
@@ -195,7 +276,15 @@ fn failed_signed_downloads_fall_back() {
             if q.contains_key("x-attos-no-redirect") {
                 return (200, vec![h("ETag", "\"v2\"")], b2.clone());
             }
-            (302, vec![h("Location", &loc), h("X-Attos-Content-Length", &n.to_string()), h("ETag", "\"v2\"")], vec![])
+            (
+                302,
+                vec![
+                    h("Location", &loc),
+                    h("X-Attos-Content-Length", &n.to_string()),
+                    h("ETag", "\"v2\""),
+                ],
+                vec![],
+            )
         }));
         let dir = tempfile::tempdir().unwrap();
         let mut c = cfg(&format!("http://{}", api.addr), dir.path());
@@ -203,7 +292,11 @@ fn failed_signed_downloads_fall_back() {
         let s = AttosSynchronizer::start(c).unwrap();
         assert_eq!(val(&s, "ins_1").unwrap(), "inserted_1", "{}", case);
         assert_eq!(s.redirect_stats(), (0, 1), "{}", case);
-        let temps = std::fs::read_dir(dir.path()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains("download")).count();
+        let temps = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("download"))
+            .count();
         assert_eq!(temps, 0, "{}: temp files left", case);
     }
 }
@@ -211,9 +304,13 @@ fn failed_signed_downloads_fall_back() {
 #[test]
 fn ordinary_redirect_drops_credentials_on_another_host() {
     let blob = fx("v1_base.attos");
-    let other = serve(Box::new(move |_, _| (200, vec![h("ETag", "\"v1\"")], blob.clone())));
+    let other = serve(Box::new(move |_, _| {
+        (200, vec![h("ETag", "\"v1\"")], blob.clone())
+    }));
     let loc = format!("http://{}/moved", other.addr);
-    let api = serve(Box::new(move |_, _| (302, vec![h("Location", &loc)], vec![])));
+    let api = serve(Box::new(move |_, _| {
+        (302, vec![h("Location", &loc)], vec![])
+    }));
     let dir = tempfile::tempdir().unwrap();
     let mut c = cfg(&format!("http://{}", api.addr), dir.path());
     c.test_redirect_any_target = true; // http loopback hosts; the credential rule is independent of it
@@ -222,17 +319,25 @@ fn ordinary_redirect_drops_credentials_on_another_host() {
     assert!(api.reqs.lock().unwrap()[0].1.contains_key("x-api-key"));
     let r = other.reqs.lock().unwrap();
     assert_eq!(r.len(), 1);
-    assert!(!r[0].1.contains_key("x-api-key") && !r[0].1.contains_key("x-attos-node-id") && !r[0].1.contains_key("authorization"));
+    assert!(
+        !r[0].1.contains_key("x-api-key")
+            && !r[0].1.contains_key("x-attos-node-id")
+            && !r[0].1.contains_key("authorization")
+    );
 }
 
 #[test]
 fn ordinary_redirect_to_a_disallowed_host_is_refused() {
     let other = serve(Box::new(|_, _| (200, vec![], b"x".to_vec())));
     let loc = format!("http://{}/moved", other.addr);
-    let api = serve(Box::new(move |_, _| (302, vec![h("Location", &loc)], vec![])));
+    let api = serve(Box::new(move |_, _| {
+        (302, vec![h("Location", &loc)], vec![])
+    }));
     let dir = tempfile::tempdir().unwrap();
     // http://127.0.0.1:<other port> is a different host:port and not on the allowlist (no test escape hatch).
-    let err = AttosSynchronizer::start(cfg(&format!("http://{}", api.addr), dir.path())).err().expect("must fail");
+    let err = AttosSynchronizer::start(cfg(&format!("http://{}", api.addr), dir.path()))
+        .err()
+        .expect("must fail");
     assert!(matches!(err, AttosError::Transport(_)), "{:?}", err);
     assert_eq!(other.reqs.lock().unwrap().len(), 0);
 }
@@ -251,13 +356,18 @@ fn patch_server(patch: Vec<u8>) -> (Srv, Arc<Mutex<u32>>) {
             }
             return (200, vec![h("ETag", "\"v1\"")], base.clone());
         }
-        if q.get("x-attos-capabilities").map_or(false, |c| c.contains("overflow")) {
+        if q.get("x-attos-capabilities")
+            .map_or(false, |c| c.contains("overflow"))
+        {
             return (
                 200,
                 vec![
                     h("X-Attos-Delta", "1"),
                     h("X-Attos-Delta-Base-ETag", "\"v1\""),
-                    h("X-Attos-Delta-Target-SHA256", "3f1d70c6fe07303e162d50266ceb2c6d292df1c54227016114520bef216164ab"),
+                    h(
+                        "X-Attos-Delta-Target-SHA256",
+                        "3f1d70c6fe07303e162d50266ceb2c6d292df1c54227016114520bef216164ab",
+                    ),
                     h("ETag", "\"v2\""),
                 ],
                 patch.clone(),
@@ -283,9 +393,15 @@ fn tail_patch_is_applied_and_hot_swapped() {
     assert_eq!(s.delta_stats(), (1, 0));
     assert_eq!(s.etag().as_deref(), Some("\"v2\""));
     // the file on disk is the byte-identical rebuilt target
-    assert_eq!(std::fs::read(dir.path().join("ds-1.attos")).unwrap(), fx("v2_expected.attos"));
+    assert_eq!(
+        std::fs::read(dir.path().join("ds-1.attos")).unwrap(),
+        fx("v2_expected.attos")
+    );
     // and nothing is left behind
-    assert!(std::fs::read_dir(dir.path()).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains("download")));
+    assert!(std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .all(|e| !e.file_name().to_string_lossy().contains("download")));
 }
 
 #[test]
@@ -299,49 +415,91 @@ fn damaged_patch_falls_back_to_the_full_file() {
     assert_eq!(s.sync_now().unwrap(), SyncOutcome::Updated);
     assert_eq!(val(&s, "ins_0").unwrap(), "inserted_0");
     assert_eq!(s.delta_stats(), (0, 1));
-    assert_eq!(std::fs::read(dir.path().join("ds-1.attos")).unwrap(), fx("v2_expected.attos"));
+    assert_eq!(
+        std::fs::read(dir.path().join("ds-1.attos")).unwrap(),
+        fx("v2_expected.attos")
+    );
     drop(full);
     let r = api.reqs.lock().unwrap();
     // the repeat asked without the delta capability
     let last = &r.last().unwrap().1;
     assert!(last.get("x-attos-accept-delta").is_none());
-    assert!(!last.get("x-attos-capabilities").map_or(false, |c| c.contains("overflow")));
+    assert!(!last
+        .get("x-attos-capabilities")
+        .map_or(false, |c| c.contains("overflow")));
     assert!(is_sync(&r[0].0));
 }
 
 fn signed_header(seed: u8, bytes: &[u8]) -> String {
-    attos_client::sign_artifact(&[seed; 32], "k1", "ds-1", &attos_client::sha256_digest(bytes))
+    attos_client::sign_artifact(
+        &[seed; 32],
+        "k1",
+        "ds-1",
+        &attos_client::sha256_digest(bytes),
+    )
 }
 
 fn signed_cfg(url: &str, dir: &std::path::Path) -> SyncConfig {
     let mut c = cfg(url, dir);
-    c.signature_keys.insert("k1".into(), attos_client::public_key_for(&[7; 32]));
+    c.signature_keys
+        .insert("k1".into(), attos_client::public_key_for(&[7; 32]));
     c
 }
 
 /// With signing enforced, the signature covers the rebuilt file: a patch is accepted when the target verifies.
 #[test]
 fn signed_tail_patch_is_verified_on_the_rebuilt_file() {
-    let (base, expected, patch) = (fx("v1_base.attos"), fx("v2_expected.attos"), fx("v1_to_v2_tail.patch"));
+    let (base, expected, patch) = (
+        fx("v1_base.attos"),
+        fx("v2_expected.attos"),
+        fx("v1_to_v2_tail.patch"),
+    );
     for good in [true, false] {
         let (b, e, p) = (base.clone(), expected.clone(), patch.clone());
-        let (sig_base, sig_exp) = (signed_header(7, &base), signed_header(if good { 7 } else { 9 }, &expected));
+        let (sig_base, sig_exp) = (
+            signed_header(7, &base),
+            signed_header(if good { 7 } else { 9 }, &expected),
+        );
         let api = serve(Box::new(move |_, q| {
             let inm = q.get("if-none-match").map(String::as_str);
             if inm != Some("\"v1\"") {
                 return if inm.is_some() {
-                    (200, vec![h("ETag", "\"v2\""), h("X-Attos-Signature", &sig_exp)], e.clone())
+                    (
+                        200,
+                        vec![h("ETag", "\"v2\""), h("X-Attos-Signature", &sig_exp)],
+                        e.clone(),
+                    )
                 } else {
-                    (200, vec![h("ETag", "\"v1\""), h("X-Attos-Signature", &sig_base)], b.clone())
+                    (
+                        200,
+                        vec![h("ETag", "\"v1\""), h("X-Attos-Signature", &sig_base)],
+                        b.clone(),
+                    )
                 };
             }
-            if q.get("x-attos-capabilities").map_or(false, |c| c.contains("overflow")) {
-                return (200, vec![h("X-Attos-Delta", "1"), h("X-Attos-Delta-Base-ETag", "\"v1\""), h("ETag", "\"v2\""), h("X-Attos-Signature", &sig_exp)], p.clone());
+            if q.get("x-attos-capabilities")
+                .map_or(false, |c| c.contains("overflow"))
+            {
+                return (
+                    200,
+                    vec![
+                        h("X-Attos-Delta", "1"),
+                        h("X-Attos-Delta-Base-ETag", "\"v1\""),
+                        h("ETag", "\"v2\""),
+                        h("X-Attos-Signature", &sig_exp),
+                    ],
+                    p.clone(),
+                );
             }
-            (200, vec![h("ETag", "\"v2\""), h("X-Attos-Signature", &sig_exp)], e.clone())
+            (
+                200,
+                vec![h("ETag", "\"v2\""), h("X-Attos-Signature", &sig_exp)],
+                e.clone(),
+            )
         }));
         let dir = tempfile::tempdir().unwrap();
-        let s = AttosSynchronizer::start(signed_cfg(&format!("http://{}", api.addr), dir.path())).unwrap();
+        let s = AttosSynchronizer::start(signed_cfg(&format!("http://{}", api.addr), dir.path()))
+            .unwrap();
         if good {
             assert_eq!(s.sync_now().unwrap(), SyncOutcome::Updated);
             assert_eq!(val(&s, "ins_0").unwrap(), "inserted_0");
@@ -369,10 +527,27 @@ fn signed_redirect_download_is_verified() {
         let b2 = blob.clone();
         let api = serve(Box::new(move |_, q| {
             if q.contains_key("x-attos-no-redirect") {
-                return (200, vec![h("ETag", "\"v2\""), h("X-Attos-Signature", &sig)], b2.clone());
+                return (
+                    200,
+                    vec![h("ETag", "\"v2\""), h("X-Attos-Signature", &sig)],
+                    b2.clone(),
+                );
             }
-            let s = if good { sig.clone() } else { sig.replace("sig=", "sig=AAAA") };
-            (302, vec![h("Location", &loc), h("X-Attos-Content-Length", &n.to_string()), h("ETag", "\"v2\""), h("X-Attos-Signature", &s)], vec![])
+            let s = if good {
+                sig.clone()
+            } else {
+                sig.replace("sig=", "sig=AAAA")
+            };
+            (
+                302,
+                vec![
+                    h("Location", &loc),
+                    h("X-Attos-Content-Length", &n.to_string()),
+                    h("ETag", "\"v2\""),
+                    h("X-Attos-Signature", &s),
+                ],
+                vec![],
+            )
         }));
         let dir = tempfile::tempdir().unwrap();
         let mut c = signed_cfg(&format!("http://{}", api.addr), dir.path());

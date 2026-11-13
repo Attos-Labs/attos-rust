@@ -4,8 +4,17 @@
 use attos_client::{AttosError, AttosMap};
 use std::path::PathBuf;
 
-fn open_patched(name: &str, fix_crc: bool, mutate: impl Fn(&mut Vec<u8>)) -> Result<AttosMap, AttosError> {
-    let mut d = std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden").join(name)).unwrap();
+fn open_patched(
+    name: &str,
+    fix_crc: bool,
+    mutate: impl Fn(&mut Vec<u8>),
+) -> Result<AttosMap, AttosError> {
+    let mut d = std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/golden")
+            .join(name),
+    )
+    .unwrap();
     mutate(&mut d);
     if fix_crc {
         let e = d.len() - 4;
@@ -33,11 +42,23 @@ fn unsupported_features_fail_closed() {
         match open_patched("golden_v2_1000.attos", true, m) {
             Err(e @ AttosError::UnsupportedFeature(_)) => {
                 let msg = e.to_string();
-                assert!(msg.contains(feature) && msg.contains("upgrade the Attos SDK"), "{msg}");
+                assert!(
+                    msg.contains(feature) && msg.contains("upgrade the Attos SDK"),
+                    "{msg}"
+                );
             }
-            other => panic!("{feature}: expected UnsupportedFeature, got {:?}", other.err()),
+            other => panic!(
+                "{feature}: expected UnsupportedFeature, got {:?}",
+                other.err()
+            ),
         }
-        assert!(matches!(open_patched("golden_v2_1000.attos", false, m), Err(AttosError::CorruptedBinary(_))), "{feature} damaged");
+        assert!(
+            matches!(
+                open_patched("golden_v2_1000.attos", false, m),
+                Err(AttosError::CorruptedBinary(_))
+            ),
+            "{feature} damaged"
+        );
     }
 }
 
@@ -46,7 +67,10 @@ fn future_version_names_upgrade() {
     match open_patched("golden_v2_1000.attos", true, |d| d[7] = 3) {
         Err(e @ AttosError::InvalidVersion(3)) => {
             let msg = e.to_string();
-            assert!(msg.contains("version 3") && msg.contains("upgrade the Attos SDK"), "{msg}");
+            assert!(
+                msg.contains("version 3") && msg.contains("upgrade the Attos SDK"),
+                "{msg}"
+            );
         }
         other => panic!("expected InvalidVersion(3), got {:?}", other.err()),
     }

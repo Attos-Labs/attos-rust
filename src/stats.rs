@@ -11,7 +11,9 @@ pub(crate) struct LatencyHistogram {
 
 impl Default for LatencyHistogram {
     fn default() -> Self {
-        Self { counts: (0..BUCKETS).map(|_| AtomicU64::new(0)).collect() }
+        Self {
+            counts: (0..BUCKETS).map(|_| AtomicU64::new(0)).collect(),
+        }
     }
 }
 
@@ -52,9 +54,16 @@ impl LatencyHistogram {
 
     /// Atomically take and reset the histogram.
     pub(crate) fn drain(&self) -> LatencySnapshot {
-        let c: Vec<u64> = self.counts.iter().map(|a| a.swap(0, Ordering::Relaxed)).collect();
+        let c: Vec<u64> = self
+            .counts
+            .iter()
+            .map(|a| a.swap(0, Ordering::Relaxed))
+            .collect();
         let total: u64 = c.iter().sum();
-        let mut s = LatencySnapshot { samples: total, ..Default::default() };
+        let mut s = LatencySnapshot {
+            samples: total,
+            ..Default::default()
+        };
         if total == 0 {
             return s;
         }
@@ -92,7 +101,9 @@ mod tests {
     use super::*;
     #[test]
     fn buckets_bound_values() {
-        for ns in [0u64, 1, 7, 8, 9, 15, 16, 100, 999, 1000, 123_456, 10_000_000] {
+        for ns in [
+            0u64, 1, 7, 8, 9, 15, 16, 100, 999, 1000, 123_456, 10_000_000,
+        ] {
             let i = index(ns);
             assert!(upper(i) >= ns, "ns={} i={} upper={}", ns, i, upper(i));
             if i > 0 {

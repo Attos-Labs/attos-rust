@@ -4,12 +4,16 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 fn golden(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden").join(name)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden")
+        .join(name)
 }
 
 fn unhex(s: &str) -> Vec<u8> {
     assert!(s.len().is_multiple_of(2));
-    (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+        .collect()
 }
 
 fn rows(name: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -24,7 +28,10 @@ fn rows(name: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 fn checksum_cfg() -> OpenConfig {
-    OpenConfig { validate_checksum: true, ..Default::default() }
+    OpenConfig {
+        validate_checksum: true,
+        ..Default::default()
+    }
 }
 
 #[test]
@@ -64,7 +71,10 @@ fn check_file(stem: &str) {
     for i in 0..2000u32 {
         let k = format!("definitely-missing-{i}");
         if !expect.contains_key(k.as_bytes()) {
-            assert!(matches!(map.get(k.as_bytes()), Err(AttosError::KeyNotFound)));
+            assert!(matches!(
+                map.get(k.as_bytes()),
+                Err(AttosError::KeyNotFound)
+            ));
         }
     }
     assert!(matches!(map.get(b""), Err(AttosError::KeyNotFound)) || expect.contains_key(&b""[..]));
@@ -121,9 +131,19 @@ fn exercise(data: &[u8], keys: &[Vec<u8>], cfg: OpenConfig) -> Result<(), AttosE
 #[test]
 fn truncated_files_error_without_panic() {
     let data = std::fs::read(golden("golden_v2_1000.attos")).unwrap();
-    let keys: Vec<Vec<u8>> = rows("golden_v2_1000.tsv").into_iter().map(|r| r.0).take(50).collect();
+    let keys: Vec<Vec<u8>> = rows("golden_v2_1000.tsv")
+        .into_iter()
+        .map(|r| r.0)
+        .take(50)
+        .collect();
     let mut cuts: Vec<usize> = (0..data.len().min(200)).collect();
-    cuts.extend([data.len() - 1, data.len() - 4, data.len() - 5, data.len() / 2, data.len() / 3]);
+    cuts.extend([
+        data.len() - 1,
+        data.len() - 4,
+        data.len() - 5,
+        data.len() / 2,
+        data.len() / 3,
+    ]);
     for cut in cuts {
         let r = exercise(&data[..cut], &keys, checksum_cfg());
         assert!(r.is_err(), "truncation to {cut} must fail with checksum on");
@@ -144,7 +164,11 @@ fn truncated_files_error_without_panic() {
 #[test]
 fn hostile_headers_report_corruption() {
     let data = std::fs::read(golden("golden_v2_1000.attos")).unwrap();
-    let keys: Vec<Vec<u8>> = rows("golden_v2_1000.tsv").into_iter().map(|r| r.0).take(50).collect();
+    let keys: Vec<Vec<u8>> = rows("golden_v2_1000.tsv")
+        .into_iter()
+        .map(|r| r.0)
+        .take(50)
+        .collect();
     let put64 = |d: &mut Vec<u8>, o: usize, v: u64| d[o..o + 8].copy_from_slice(&v.to_be_bytes());
     type Mutator = Box<dyn Fn(&mut Vec<u8>)>;
     let cases: Vec<(&str, Mutator)> = vec![
@@ -178,7 +202,11 @@ fn hostile_headers_report_corruption() {
 #[test]
 fn hostile_body_never_panics() {
     let data = std::fs::read(golden("golden_v2_1000.attos")).unwrap();
-    let keys: Vec<Vec<u8>> = rows("golden_v2_1000.tsv").into_iter().map(|r| r.0).take(200).collect();
+    let keys: Vec<Vec<u8>> = rows("golden_v2_1000.tsv")
+        .into_iter()
+        .map(|r| r.0)
+        .take(200)
+        .collect();
     // deterministic xorshift corruption of single bytes / words anywhere past the magic
     let mut s = 0x9E3779B97F4A7C15u64;
     for _ in 0..300 {
@@ -204,10 +232,16 @@ fn hostile_body_never_panics() {
 fn bad_version_and_magic() {
     let mut d = std::fs::read(golden("golden_v2_1.attos")).unwrap();
     d[7] = 3;
-    assert!(matches!(exercise(&d, &[], OpenConfig::default()), Err(AttosError::InvalidVersion(3))));
+    assert!(matches!(
+        exercise(&d, &[], OpenConfig::default()),
+        Err(AttosError::InvalidVersion(3))
+    ));
     d[7] = 2;
     d[0] = b'X';
-    assert!(matches!(exercise(&d, &[], OpenConfig::default()), Err(AttosError::InvalidMagic)));
+    assert!(matches!(
+        exercise(&d, &[], OpenConfig::default()),
+        Err(AttosError::InvalidMagic)
+    ));
 }
 
 /// Hand-built single-key version 1 file: v1 must keep working unchanged.

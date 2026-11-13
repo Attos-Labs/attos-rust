@@ -35,9 +35,7 @@ pub fn report_body(
         .as_nanos()
         .to_string();
     let clamp = |v: u64| v.min(i64::MAX as u64) as i64;
-    let metric = |name: &str, v: u64| {
-        json!({"name": name, "gauge": {"dataPoints": [{"asInt": clamp(v), "timeUnixNano": now}]}})
-    };
+    let metric = |name: &str, v: u64| json!({"name": name, "gauge": {"dataPoints": [{"asInt": clamp(v), "timeUnixNano": now}]}});
     json!({"resourceSpans": [{
         "resource": {"attributes": [
             {"key": "attos.dataset_id", "value": {"stringValue": dataset_id}},

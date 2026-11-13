@@ -145,8 +145,13 @@ impl AttosClient {
             drop(retired);
             std::thread::sleep(Duration::from_millis(1));
             waited += Duration::from_millis(1);
+            #[allow(clippy::manual_is_multiple_of)]
+            // is_multiple_of needs a newer MSRV than the crate declares
             if waited.as_millis() % 5000 == 0 {
-                warn!("hot-swap waiting: {} retired maps still referenced by readers", MAX_RETIRED);
+                warn!(
+                    "hot-swap waiting: {} retired maps still referenced by readers",
+                    MAX_RETIRED
+                );
             }
             retired = self.shared.retired.lock().unwrap();
         }
@@ -227,7 +232,9 @@ impl AttosClient {
     /// Sends no API key, so it cannot authenticate against the contract
     /// endpoint; use [`crate::AttosSynchronizer`] (which runs the CONTRACTS §5
     /// emitter with `X-API-Key`) instead. Kept for API compatibility.
-    #[deprecated(note = "use AttosSynchronizer, which reports telemetry with X-API-Key per CONTRACTS §5")]
+    #[deprecated(
+        note = "use AttosSynchronizer, which reports telemetry with X-API-Key per CONTRACTS §5"
+    )]
     #[allow(clippy::too_many_arguments)]
     pub async fn report_telemetry(
         &self,

@@ -11,11 +11,15 @@ const CASES: &[(&str, &str, bool)] = &[
 ];
 
 fn golden(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden").join(name)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden")
+        .join(name)
 }
 
 fn unhex(s: &str) -> Vec<u8> {
-    (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+        .collect()
 }
 
 fn rows(stem: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -31,7 +35,10 @@ fn rows(stem: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 fn crc() -> OpenConfig {
-    OpenConfig { validate_checksum: true, ..Default::default() }
+    OpenConfig {
+        validate_checksum: true,
+        ..Default::default()
+    }
 }
 
 #[test]
@@ -65,7 +72,10 @@ fn width5_goldens_read_every_row() {
         for i in 0..500u32 {
             let k = format!("missing-key-{i}");
             if !expect.contains_key(k.as_bytes()) {
-                assert!(matches!(map.get_owned(k.as_bytes()), Err(AttosError::KeyNotFound)), "{file}");
+                assert!(
+                    matches!(map.get_owned(k.as_bytes()), Err(AttosError::KeyNotFound)),
+                    "{file}"
+                );
             }
         }
     }
@@ -80,13 +90,20 @@ fn width5_checksum_detects_flip() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("bad.attos");
         std::fs::write(&p, &d).unwrap();
-        assert!(matches!(AttosMap::open_with_config(&p, crc()), Err(AttosError::ChecksumMismatch { .. })));
+        assert!(matches!(
+            AttosMap::open_with_config(&p, crc()),
+            Err(AttosError::ChecksumMismatch { .. })
+        ));
     }
 }
 
 #[test]
 fn invalid_offset_width_is_corrupt() {
-    for file in ["golden_v2_1000", "golden_v2_w5_1000", "golden_v2_lz4b16_1000"] {
+    for file in [
+        "golden_v2_1000",
+        "golden_v2_w5_1000",
+        "golden_v2_lz4b16_1000",
+    ] {
         for w in [1u8, 3, 6, 7, 8, 255] {
             let mut d = std::fs::read(golden(&format!("{file}.attos"))).unwrap();
             assert!(d[52] == 0 || d[52] == 4 || d[52] == 5);
@@ -96,7 +113,10 @@ fn invalid_offset_width_is_corrupt() {
             std::fs::write(&p, &d).unwrap();
             match AttosMap::open(&p) {
                 Err(AttosError::CorruptedBinary(_)) => {}
-                other => panic!("{file} width {w}: expected CorruptedBinary, got {:?}", other.err()),
+                other => panic!(
+                    "{file} width {w}: expected CorruptedBinary, got {:?}",
+                    other.err()
+                ),
             }
         }
     }
@@ -122,5 +142,8 @@ fn get_copy_works_on_compressed_files() {
     map.get_copy(&k, &mut dst).unwrap();
     assert_eq!(&dst[..3], b"pre");
     assert_eq!(&dst[3..], v.as_slice());
-    assert!(matches!(map.get_copy(b"nope-nope", &mut dst), Err(AttosError::KeyNotFound)));
+    assert!(matches!(
+        map.get_copy(b"nope-nope", &mut dst),
+        Err(AttosError::KeyNotFound)
+    ));
 }

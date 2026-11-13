@@ -31,7 +31,9 @@ pub fn parse_public_key(b64: &str) -> Result<[u8; 32], AttosError> {
             }
         }
     }
-    Err(AttosError::Config("public key must be 32 bytes, base64 encoded".into()))
+    Err(AttosError::Config(
+        "public key must be 32 bytes, base64 encoded".into(),
+    ))
 }
 
 pub(crate) fn signed_message(dataset_id: &str, digest: &[u8]) -> Vec<u8> {
@@ -71,8 +73,14 @@ pub(crate) fn verify(
     if alg != "ed25519" {
         return Err(invalid(format!("unsupported algorithm {:?}", alg)));
     }
-    let pk = keys.get(kid).ok_or_else(|| invalid(format!("unknown key id {:?}", kid)))?;
-    let raw = STANDARD.decode(sig).ok().filter(|r| r.len() == 64).ok_or_else(|| invalid("malformed signature".into()))?;
+    let pk = keys
+        .get(kid)
+        .ok_or_else(|| invalid(format!("unknown key id {:?}", kid)))?;
+    let raw = STANDARD
+        .decode(sig)
+        .ok()
+        .filter(|r| r.len() == 64)
+        .ok_or_else(|| invalid("malformed signature".into()))?;
     let vk = VerifyingKey::from_bytes(pk).map_err(|_| invalid("malformed public key".into()))?;
     let sg = Signature::from_slice(&raw).map_err(|_| invalid("malformed signature".into()))?;
     vk.verify(&signed_message(dataset_id, digest), &sg)
@@ -84,12 +92,18 @@ pub fn sign_artifact(seed: &[u8; 32], kid: &str, dataset_id: &str, digest: &[u8]
     use ed25519_dalek::Signer;
     let sk = ed25519_dalek::SigningKey::from_bytes(seed);
     let sig = sk.sign(&signed_message(dataset_id, digest));
-    format!("alg=ed25519; kid={}; sig={}", kid, STANDARD.encode(sig.to_bytes()))
+    format!(
+        "alg=ed25519; kid={}; sig={}",
+        kid,
+        STANDARD.encode(sig.to_bytes())
+    )
 }
 
 /// The public key matching a signing seed (for tests and tooling).
 pub fn public_key_for(seed: &[u8; 32]) -> [u8; 32] {
-    ed25519_dalek::SigningKey::from_bytes(seed).verifying_key().to_bytes()
+    ed25519_dalek::SigningKey::from_bytes(seed)
+        .verifying_key()
+        .to_bytes()
 }
 
 /// SHA-256 of `data` (the digest that is signed).

@@ -145,7 +145,11 @@ pub(crate) fn packed_size(count: u64, w: u64) -> Option<u64> {
 /// Size in bytes of the offsets section: `ceil(count*w/8)*8`, plus 8 bytes of slack when `w == 5`.
 pub(crate) fn offsets_size(count: u64, w: usize) -> Option<u64> {
     let raw = count.checked_mul(w as u64)?.checked_add(7)? / 8 * 8;
-    if w == 5 { raw.checked_add(8) } else { Some(raw) }
+    if w == 5 {
+        raw.checked_add(8)
+    } else {
+        Some(raw)
+    }
 }
 
 /// Reads offsets entry `i` (4-byte u32 LE or 5-byte 40-bit LE). `None` if out of bounds.
@@ -230,14 +234,20 @@ impl V2Params {
         let free = ((m - n) * 4).div_ceil(8) * 8;
         let flags = d[8];
         if flags & !7 != 0 {
-            return Err(unsupported(format!("flags {:#04x} (unknown bits {:#04x})", flags, flags & !7), "unsupported v2 flags"));
+            return Err(unsupported(
+                format!("flags {:#04x} (unknown bits {:#04x})", flags, flags & !7),
+                "unsupported v2 flags",
+            ));
         }
         let compressed = flags & 1 != 0;
         let mut lean_w = 0usize;
         if flags & 2 != 0 {
             lean_w = d[53] as usize;
             if lean_w != 4 && lean_w != 8 {
-                return Err(unsupported(format!("lean-key fingerprint width {}", lean_w), "invalid fingerprint width"));
+                return Err(unsupported(
+                    format!("lean-key fingerprint width {}", lean_w),
+                    "invalid fingerprint width",
+                ));
             }
         }
         let mut block_shift = 0u32;
@@ -252,7 +262,12 @@ impl V2Params {
         let off_w: usize = match d[52] {
             0 | 4 => 4,
             5 => 5,
-            w => return Err(unsupported(format!("offset width {}", w), "unsupported offset width")),
+            w => {
+                return Err(unsupported(
+                    format!("offset width {}", w),
+                    "unsupported offset width",
+                ))
+            }
         };
         let off_bytes = offsets_size(n_offsets, off_w).ok_or_else(|| bad("v2 offsets overflow"))?;
         let end = (V2_HEADER_SIZE as u64)
@@ -261,7 +276,9 @@ impl V2Params {
             .and_then(|v| v.checked_add(free))
             .and_then(|v| v.checked_add(off_bytes))
             .ok_or_else(|| bad("v2 sections overflow"))?;
-        let total = end.checked_add(4).ok_or_else(|| bad("v2 sections overflow"))?;
+        let total = end
+            .checked_add(4)
+            .ok_or_else(|| bad("v2 sections overflow"))?;
         if total > d.len() as u64 {
             return Err(bad("file too small for v2 sections"));
         }
@@ -276,8 +293,19 @@ impl V2Params {
             return Err(bad("v2 blob size exceeds file"));
         }
         Ok(Self {
-            n, m, nb, p2, p1thr, fw, bw,
-            front_off, back_off, free_off, offsets_off, off_w, blob_off,
+            n,
+            m,
+            nb,
+            p2,
+            p1thr,
+            fw,
+            bw,
+            front_off,
+            back_off,
+            free_off,
+            offsets_off,
+            off_w,
+            blob_off,
             blob_len: blob_len as usize,
             compressed,
             block_shift,
@@ -295,7 +323,6 @@ pub(crate) fn get_bits(section: &[u8], i: u64, w: u64) -> Option<u64> {
     let chunk: [u8; 8] = section.get(b..b.checked_add(8)?)?.try_into().ok()?;
     Some((u64::from_le_bytes(chunk) >> (off & 7)) & ((1u64 << w) - 1))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -334,7 +361,10 @@ mod tests {
             (b"key\x00with\x00nul", "ada0d5aff9ff4838"),
         ];
         for (k, want) in cases {
-            let hex: String = key_fingerprint(k).iter().map(|b| format!("{b:02x}")).collect();
+            let hex: String = key_fingerprint(k)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
             assert_eq!(&hex, want, "key {:?}", k);
         }
     }
@@ -345,7 +375,10 @@ mod tests {
         assert_eq!(uvarint(&[0xac, 0x02]), Some((300, 2)));
         assert_eq!(uvarint(&[0x80]), None);
         assert_eq!(uvarint(&[0xff; 11]), None);
-        assert_eq!(uvarint(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02]), None);
+        assert_eq!(
+            uvarint(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02]),
+            None
+        );
         assert!(uvarint(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]).is_some());
     }
 }

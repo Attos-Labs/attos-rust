@@ -14,7 +14,10 @@ use tracing::{debug, info, instrument, warn};
 use crate::error::AttosError;
 use crate::overflow::{Overflow, Probe};
 use crate::stats::LatencyHistogram;
-use crate::v2::{key_fingerprint, lz4_decompress, next_record, read_offset, uvarint, get_bits, V2Params, MAX_BLOCK_RAW};
+use crate::v2::{
+    get_bits, key_fingerprint, lz4_decompress, next_record, read_offset, uvarint, V2Params,
+    MAX_BLOCK_RAW,
+};
 pub use crate::v2::{pthash_hp, pthash_mix, pthash_reduce};
 
 const MAGIC_ATTO: &[u8; 4] = b"ATTO";
@@ -112,25 +115,38 @@ pub(crate) struct Layout {
 pub(crate) fn parse_layout(data: &[u8], check_crc: bool) -> Result<Layout, AttosError> {
     let sz = data.len() as u64;
     if sz < 4 {
-        return Err(AttosError::CorruptedBinary(format!("file too small ({} bytes)", sz)));
+        return Err(AttosError::CorruptedBinary(format!(
+            "file too small ({} bytes)",
+            sz
+        )));
     }
     if &data[0..4] != MAGIC_ATTO {
         return Err(AttosError::InvalidMagic);
     }
     if sz < 8 {
-        return Err(AttosError::CorruptedBinary("file too small for version".into()));
+        return Err(AttosError::CorruptedBinary(
+            "file too small for version".into(),
+        ));
     }
     let version = u32::from_be_bytes(data[4..8].try_into().unwrap());
     if version != 1 {
         return Err(AttosError::InvalidVersion(version));
     }
     if sz < HEADER_SIZE as u64 {
-        return Err(AttosError::CorruptedBinary(format!("file too small for header ({} bytes)", sz)));
+        return Err(AttosError::CorruptedBinary(format!(
+            "file too small for header ({} bytes)",
+            sz
+        )));
     }
     let w: u64 = match data[8] {
         0x01 => 2,
         0x02 => 4,
-        f => return Err(AttosError::CorruptedBinary(format!("invalid routing flag 0x{:02x}", f))),
+        f => {
+            return Err(AttosError::CorruptedBinary(format!(
+                "invalid routing flag 0x{:02x}",
+                f
+            )))
+        }
     };
     let slots = u64::from_be_bytes(data[9..17].try_into().unwrap());
     let buckets = u64::from_be_bytes(data[17..25].try_into().unwrap());
@@ -142,7 +158,7 @@ pub(crate) fn parse_layout(data: &[u8], check_crc: bool) -> Result<Layout, Attos
         .and_then(|v| v.checked_add(HEADER_SIZE as u64));
     let d = r.and_then(|r| slots.checked_mul(8).and_then(|v| v.checked_add(r)));
     let d = match d {
-        Some(d) if d.checked_add(4).map_or(false, |e| e <= sz) => d,
+        Some(d) if d.checked_add(4).is_some_and(|e| e <= sz) => d,
         _ => {
             return Err(AttosError::CorruptedBinary(format!(
                 "header counts (S={}, B={}) exceed file size {}",
@@ -219,7 +235,10 @@ impl AttosMap {
     /// Returns a typed `AttosError` on every known failure mode:
     /// `InvalidMagic`, `InvalidVersion(v)`, `CorruptedBinary`, `ChecksumMismatch`.
     #[instrument(skip(path), fields(path = %path.as_ref().display()))]
-    pub fn open_with_config<P: AsRef<Path>>(path: P, config: OpenConfig) -> Result<Self, AttosError> {
+    pub fn open_with_config<P: AsRef<Path>>(
+        path: P,
+        config: OpenConfig,
+    ) -> Result<Self, AttosError> {
         Self::open_inner(path.as_ref(), config, config.validate_checksum)
     }
 
@@ -229,12 +248,19 @@ impl AttosMap {
         Self::open_inner(path.as_ref(), OpenConfig::default(), true).map(|_| ())
     }
 
-    pub(crate) fn open_inner(path: &Path, config: OpenConfig, check_crc: bool) -> Result<Self, AttosError> {
+    pub(crate) fn open_inner(
+        path: &Path,
+        config: OpenConfig,
+        check_crc: bool,
+    ) -> Result<Self, AttosError> {
         debug!("Opening AttosMap file");
         let file = File::open(path).map_err(AttosError::IoError)?;
         let len = file.metadata().map_err(AttosError::IoError)?.len();
         if len < 4 {
-            return Err(AttosError::CorruptedBinary(format!("file too small ({} bytes)", len)));
+            return Err(AttosError::CorruptedBinary(format!(
+                "file too small ({} bytes)",
+                len
+            )));
         }
         // SAFETY: memmap2 requires that the file is not modified or truncated
         // while mapped. The SDK only maps files it owns: the synchronizer writes
@@ -256,7 +282,9 @@ impl AttosMap {
             None
         };
         let ov = match &v2 {
-            Some(p) if p.overflow => Some(Overflow::parse(&mmap, (p.blob_off + p.blob_len) as u64)?),
+            Some(p) if p.overflow => {
+                Some(Overflow::parse(&mmap, (p.blob_off + p.blob_len) as u64)?)
+            }
             _ => None,
         };
         let layout = match &v2 {
@@ -401,7 +429,10 @@ impl AttosMap {
 
     /// Total lookups served by this map (telemetry).
     pub fn lookups(&self) -> u64 {
-        self.lookups.iter().map(|s| s.0.load(Ordering::Relaxed)).sum()
+        self.lookups
+            .iter()
+            .map(|s| s.0.load(Ordering::Relaxed))
+            .sum()
     }
 
     #[inline(always)]
@@ -439,7 +470,11 @@ impl AttosMap {
         let word = read_u64(data, self.values_offset + slot as usize * 8);
         let len = (word & 0xFFFF_FFFF) as usize;
         if len == 0 {
-            return Err(if self.closed { AttosError::MapClosed } else { AttosError::KeyNotFound });
+            return Err(if self.closed {
+                AttosError::MapClosed
+            } else {
+                AttosError::KeyNotFound
+            });
         }
         let start = self.blob_offset + (word >> 32) as usize;
         let end = start + len;
@@ -449,7 +484,9 @@ impl AttosMap {
         let e = &data[start..end];
         let kl = read_u16(e, 0) as usize;
         if 2 + kl > len {
-            return Err(AttosError::CorruptedBinary("key length exceeds entry".into()));
+            return Err(AttosError::CorruptedBinary(
+                "key length exceeds entry".into(),
+            ));
         }
         if &e[2..2 + kl] != key {
             return Err(AttosError::KeyNotFound);
@@ -612,21 +649,31 @@ impl AttosMap {
     #[inline(always)]
     fn v2_record(&self, p: &V2Params, slot: u64) -> Result<&[u8], AttosError> {
         let corrupt = || AttosError::CorruptedBinary("payload index out of bounds".into());
-        let start = read_offset(&self.mmap, p.offsets_off, p.off_w, slot).ok_or_else(corrupt)? as usize;
-        let end = read_offset(&self.mmap, p.offsets_off, p.off_w, slot + 1).ok_or_else(corrupt)? as usize;
+        let start =
+            read_offset(&self.mmap, p.offsets_off, p.off_w, slot).ok_or_else(corrupt)? as usize;
+        let end =
+            read_offset(&self.mmap, p.offsets_off, p.off_w, slot + 1).ok_or_else(corrupt)? as usize;
         if start > end || end > p.blob_len {
             return Err(corrupt());
         }
-        self.mmap.get(p.blob_off + start..p.blob_off + end).ok_or_else(corrupt)
+        self.mmap
+            .get(p.blob_off + start..p.blob_off + end)
+            .ok_or_else(corrupt)
     }
 
     /// Splits a record and returns its value if the stored key (or, for lean files,
     /// the stored fingerprint) matches `key`.
     #[inline(always)]
-    fn split_record<'a>(lean_w: usize, payload: &'a [u8], key: &[u8]) -> Result<&'a [u8], AttosError> {
+    fn split_record<'a>(
+        lean_w: usize,
+        payload: &'a [u8],
+        key: &[u8],
+    ) -> Result<&'a [u8], AttosError> {
         if lean_w != 0 {
             if payload.len() < lean_w {
-                return Err(AttosError::CorruptedBinary("payload too small for fingerprint".into()));
+                return Err(AttosError::CorruptedBinary(
+                    "payload too small for fingerprint".into(),
+                ));
             }
             let fp = key_fingerprint(key);
             if payload[..lean_w] != fp[..lean_w] {
@@ -635,7 +682,9 @@ impl AttosMap {
             return Ok(&payload[lean_w..]);
         }
         if payload.len() < 2 {
-            return Err(AttosError::CorruptedBinary("payload too small for key length".into()));
+            return Err(AttosError::CorruptedBinary(
+                "payload too small for key length".into(),
+            ));
         }
         let key_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
         let key_bytes = payload
@@ -657,12 +706,16 @@ impl AttosMap {
     /// Returns the (blob-relative checked) bytes of block `b`, method byte included.
     fn v2_block(&self, p: &V2Params, b: u64) -> Result<&[u8], AttosError> {
         let corrupt = || AttosError::CorruptedBinary("block index out of bounds".into());
-        let start = read_offset(&self.mmap, p.offsets_off, p.off_w, b).ok_or_else(corrupt)? as usize;
-        let end = read_offset(&self.mmap, p.offsets_off, p.off_w, b + 1).ok_or_else(corrupt)? as usize;
+        let start =
+            read_offset(&self.mmap, p.offsets_off, p.off_w, b).ok_or_else(corrupt)? as usize;
+        let end =
+            read_offset(&self.mmap, p.offsets_off, p.off_w, b + 1).ok_or_else(corrupt)? as usize;
         if end <= start || end > p.blob_len {
             return Err(corrupt());
         }
-        self.mmap.get(p.blob_off + start..p.blob_off + end).ok_or_else(corrupt)
+        self.mmap
+            .get(p.blob_off + start..p.blob_off + end)
+            .ok_or_else(corrupt)
     }
 
     /// Decodes a block into `uvarint(len) | record` sequences. Stored blocks borrow the mapping.
@@ -700,7 +753,9 @@ impl AttosMap {
             _ => return self.get(key).map(Cow::Borrowed),
         };
         let h = hash_key(key);
-        self.lookups[(h as usize) & (STRIPES - 1)].0.fetch_add(1, Ordering::Relaxed);
+        self.lookups[(h as usize) & (STRIPES - 1)]
+            .0
+            .fetch_add(1, Ordering::Relaxed);
         if let Some(ov) = &self.ov {
             match ov.probe(&self.mmap, h, key) {
                 Probe::Value(v) => return Ok(Cow::Borrowed(v)),
@@ -711,7 +766,12 @@ impl AttosMap {
         self.main_cow(p, h, key)
     }
 
-    fn main_cow<'a>(&'a self, p: &V2Params, h: u64, key: &[u8]) -> Result<Cow<'a, [u8]>, AttosError> {
+    fn main_cow<'a>(
+        &'a self,
+        p: &V2Params,
+        h: u64,
+        key: &[u8],
+    ) -> Result<Cow<'a, [u8]>, AttosError> {
         let slot = self.v2_slot(p, h)?;
         let blk = self.v2_block(p, slot >> p.block_shift)?;
         let raw = Self::decode_block(blk)?;
@@ -745,10 +805,14 @@ impl AttosMap {
 
     /// Live keys of a file with an overflow: main keys, plus new overflow keys, minus tombstoned main keys.
     fn count_rows_overflow(&self) -> usize {
-        let Some(ov) = &self.ov else { return self.total_keys as usize };
+        let Some(ov) = &self.ov else {
+            return self.total_keys as usize;
+        };
         let mut n = self.total_keys as usize;
         for i in 0..ov.len() {
-            let Some((k, _, tomb)) = ov.entry(&self.mmap, i) else { continue };
+            let Some((k, _, tomb)) = ov.entry(&self.mmap, i) else {
+                continue;
+            };
             match (tomb, self.main_has(hash_key(k), k)) {
                 (true, true) => n -= 1,
                 (false, false) => n += 1,
@@ -765,8 +829,7 @@ impl AttosMap {
 
     /// Like `get_string` but works for compressed files (returns a `String`).
     pub fn get_string_owned(&self, key: &str) -> Result<String, AttosError> {
-        String::from_utf8(self.get_owned(key.as_bytes())?)
-            .map_err(|e| e.utf8_error().into())
+        String::from_utf8(self.get_owned(key.as_bytes())?).map_err(|e| e.utf8_error().into())
     }
 
     /// Like `multi_lookup` but works for every file kind.
@@ -800,11 +863,15 @@ impl AttosMap {
         let per = 1u64 << p.block_shift;
         for b in 0..p.n.div_ceil(per) {
             let Ok(blk) = self.v2_block(p, b) else { return };
-            let Ok(raw) = Self::decode_block(blk) else { return };
+            let Ok(raw) = Self::decode_block(blk) else {
+                return;
+            };
             let count = per.min(p.n - b * per);
             let mut pos = 0usize;
             for _ in 0..count {
-                let Some((s, e)) = next_record(&raw, pos) else { return };
+                let Some((s, e)) = next_record(&raw, pos) else {
+                    return;
+                };
                 pos = e;
                 let rec = &raw[s..e];
                 if p.lean_w != 0 {

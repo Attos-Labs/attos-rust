@@ -10,7 +10,10 @@ pub enum AttosError {
     InvalidVersion(u32),
     /// The file is intact (CRC verifies) but uses a format feature newer than this SDK; upgrade the SDK.
     UnsupportedFeature(String),
-    ChecksumMismatch { expected: u32, actual: u32 },
+    ChecksumMismatch {
+        expected: u32,
+        actual: u32,
+    },
     MapClosed,
     /// Signing is enforced but the response (or the cache) carried no signature.
     SignatureMissing,
@@ -23,7 +26,10 @@ pub enum AttosError {
     Utf8Error(std::str::Utf8Error),
     /// Sync endpoint answered with a non-200/304 status. `retry_after` is set
     /// for 402/429 when the server sent `Retry-After`.
-    HttpStatus { code: u16, retry_after: Option<Duration> },
+    HttpStatus {
+        code: u16,
+        retry_after: Option<Duration>,
+    },
     /// Network/transport failure or a body shorter than `Content-Length`.
     Transport(String),
     /// Configuration error (e.g. invalid node id).
@@ -33,7 +39,13 @@ pub enum AttosError {
 impl AttosError {
     /// 402 / 429: node or quota limit.
     pub fn is_quota(&self) -> bool {
-        matches!(self, AttosError::HttpStatus { code: 402 | 429, .. })
+        matches!(
+            self,
+            AttosError::HttpStatus {
+                code: 402 | 429,
+                ..
+            }
+        )
     }
 }
 

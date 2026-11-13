@@ -113,7 +113,8 @@ impl Overflow {
         };
         // Every record must parse, so lookups never meet a malformed entry.
         for i in 0..ov.k {
-            ov.entry(d, i).ok_or_else(|| bad("invalid overflow entry"))?;
+            ov.entry(d, i)
+                .ok_or_else(|| bad("invalid overflow entry"))?;
         }
         Ok(ov)
     }
@@ -126,8 +127,12 @@ impl Overflow {
     /// Record `i`: `(key, value, tombstone)`; `None` if malformed (rejected at open).
     #[inline(always)]
     pub(crate) fn entry<'a>(&self, d: &'a [u8], i: usize) -> Option<(&'a [u8], &'a [u8], bool)> {
-        let s = self.data_off.checked_add(le64(d, self.off_off + i * 8) as usize)?;
-        let e = self.data_off.checked_add(le64(d, self.off_off + (i + 1) * 8) as usize)?;
+        let s = self
+            .data_off
+            .checked_add(le64(d, self.off_off + i * 8) as usize)?;
+        let e = self
+            .data_off
+            .checked_add(le64(d, self.off_off + (i + 1) * 8) as usize)?;
         let rec = d.get(s..e)?;
         if rec.len() < 6 {
             return None;
@@ -161,7 +166,11 @@ impl Overflow {
             // Equal hash, different key: keep looking, then fall through to the main table.
             if let Some((k, v, tomb)) = self.entry(d, i) {
                 if k == key {
-                    return if tomb { Probe::Tombstone } else { Probe::Value(v) };
+                    return if tomb {
+                        Probe::Tombstone
+                    } else {
+                        Probe::Value(v)
+                    };
                 }
             }
             i += 1;

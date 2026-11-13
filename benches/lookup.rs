@@ -12,7 +12,9 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use std::path::PathBuf;
 
 fn unhex(s: &str) -> Vec<u8> {
-    (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+        .collect()
 }
 
 fn key(i: usize) -> Vec<u8> {
@@ -42,7 +44,10 @@ fn big(c: &mut Criterion) {
         eprintln!("ATTOS_BENCH_FILE not set: skipping lookup/hot_1k and lookup/random_1M");
         return;
     };
-    let n: usize = std::env::var("ATTOS_BENCH_KEYS").ok().and_then(|v| v.parse().ok()).unwrap_or(1_000_000);
+    let n: usize = std::env::var("ATTOS_BENCH_KEYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000_000);
     let map = AttosMap::open(&path).unwrap();
     // pull the whole file into the page cache so the benchmark measures lookups, not disk reads
     let _ = std::fs::read(&path).map(|b| black_box(b.len()));
@@ -54,10 +59,15 @@ fn big(c: &mut Criterion) {
         state ^= state << 17;
         state
     };
-    let hot: Vec<Vec<u8>> = (0..1000).map(|_| key((next() % n as u64) as usize)).collect();
-    let random: Vec<Vec<u8>> = (0..1 << 20).map(|_| key((next() % n as u64) as usize)).collect();
+    let hot: Vec<Vec<u8>> = (0..1000)
+        .map(|_| key((next() % n as u64) as usize))
+        .collect();
+    let random: Vec<Vec<u8>> = (0..1 << 20)
+        .map(|_| key((next() % n as u64) as usize))
+        .collect();
     for k in hot.iter().chain(random.iter().take(1000)) {
-        map.get(k).expect("key missing: is ATTOS_BENCH_FILE built with the documented keys?");
+        map.get(k)
+            .expect("key missing: is ATTOS_BENCH_FILE built with the documented keys?");
     }
 
     let mut i = 0usize;

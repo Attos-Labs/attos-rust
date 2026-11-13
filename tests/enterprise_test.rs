@@ -1,13 +1,14 @@
-use attos_client::{AttosMap, OpenConfig, AttosClient};
+#![allow(clippy::needless_range_loop)]
+use attos_client::{AttosClient, AttosMap, OpenConfig};
 use crc32fast::Hasher;
 use std::fs::File;
+use std::hash::Hasher as StdHasher;
 use std::io::Write;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 use twox_hash::XxHash64;
-use std::hash::Hasher as StdHasher;
 
 fn generate_test_attos(num_keys: usize, with_crc: bool) -> (tempfile::TempDir, String) {
     let dir = tempdir().unwrap();
@@ -163,7 +164,8 @@ fn test_concurrent_hot_reload() {
     });
 
     let mut handles = vec![];
-    for _ in 0..100 { // 100 threads for stress test
+    for _ in 0..100 {
+        // 100 threads for stress test
         let client_clone = reader_client.clone();
         handles.push(thread::spawn(move || {
             let end = Instant::now() + Duration::from_secs(5);
@@ -192,7 +194,14 @@ fn test_adversarial_fuzzing() {
 
     for (corruption, expect_err) in tests {
         let (_dir, path) = generate_corrupt_attos(corruption);
-        let res = AttosMap::open_with_config(&path, OpenConfig { validate_checksum: true, pin_to_memory: false, ..Default::default() });
+        let res = AttosMap::open_with_config(
+            &path,
+            OpenConfig {
+                validate_checksum: true,
+                pin_to_memory: false,
+                ..Default::default()
+            },
+        );
         assert_eq!(res.is_err(), expect_err, "failed on {}", corruption);
     }
 }

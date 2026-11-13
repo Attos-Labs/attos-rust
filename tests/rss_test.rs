@@ -36,13 +36,26 @@ fn open_leaves_mapping_mostly_non_resident() {
 
     for (name, cfg) in [
         ("default", OpenConfig::default()),
-        ("validate", OpenConfig { validate_checksum: true, ..Default::default() }),
+        (
+            "validate",
+            OpenConfig {
+                validate_checksum: true,
+                ..Default::default()
+            },
+        ),
     ] {
         let m = AttosMap::open_with_config(path, cfg).unwrap();
         let rss = mapped_rss(path);
         let frac = rss as f64 / size as f64;
-        eprintln!("{name:8} resident {rss} of {size} bytes ({:.1}%)", frac * 100.0);
-        assert!(frac < 0.10, "{name}: {:.1}% resident after open", frac * 100.0);
+        eprintln!(
+            "{name:8} resident {rss} of {size} bytes ({:.1}%)",
+            frac * 100.0
+        );
+        assert!(
+            frac < 0.10,
+            "{name}: {:.1}% resident after open",
+            frac * 100.0
+        );
         assert_eq!(m.get(b"key_123").unwrap().len(), 1000);
         drop(m);
     }

@@ -11,11 +11,15 @@ const CASES: &[(&str, &str)] = &[
 ];
 
 fn golden(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden").join(name)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden")
+        .join(name)
 }
 
 fn unhex(s: &str) -> Vec<u8> {
-    (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+        .collect()
 }
 
 fn rows(stem: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -31,7 +35,10 @@ fn rows(stem: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 fn crc() -> OpenConfig {
-    OpenConfig { validate_checksum: true, ..Default::default() }
+    OpenConfig {
+        validate_checksum: true,
+        ..Default::default()
+    }
 }
 
 #[test]
@@ -49,7 +56,10 @@ fn every_row_of_every_compressed_golden() {
             expect.insert(k.clone(), v.clone());
         }
         // zero-copy API is refused, not silently wrong
-        assert!(matches!(map.get(&rows[0].0), Err(AttosError::CompressedRequiresOwned)));
+        assert!(matches!(
+            map.get(&rows[0].0),
+            Err(AttosError::CompressedRequiresOwned)
+        ));
         let mut seen = 0;
         map.scan(|k, v| {
             assert_eq!(expect.get(k).map(Vec::as_slice), Some(v), "{file}");
@@ -66,7 +76,10 @@ fn every_row_of_every_compressed_golden() {
         for i in 0..1000u32 {
             let k = format!("missing-key-{i}");
             if !expect.contains_key(k.as_bytes()) {
-                assert!(matches!(map.get_owned(k.as_bytes()), Err(AttosError::KeyNotFound)), "{file}");
+                assert!(
+                    matches!(map.get_owned(k.as_bytes()), Err(AttosError::KeyNotFound)),
+                    "{file}"
+                );
             }
         }
         assert!(map.get_string_owned("zzz-not-there").is_err());
@@ -83,7 +96,10 @@ fn multi_lookup_cow_composite_key() {
         .expect("golden set contains NUL keys");
     let factors: Vec<&[u8]> = k.split(|b| *b == 0).collect();
     assert_eq!(&*map.multi_lookup_cow(&factors).unwrap(), v.as_slice());
-    assert!(matches!(map.multi_lookup(&factors), Err(AttosError::CompressedRequiresOwned)));
+    assert!(matches!(
+        map.multi_lookup(&factors),
+        Err(AttosError::CompressedRequiresOwned)
+    ));
 }
 
 #[test]
@@ -112,13 +128,20 @@ fn checksum_detects_flip() {
     let mut d = std::fs::read(golden("golden_v2_lz4b16_1000.attos")).unwrap();
     let n = d.len();
     d[n - 100] ^= 1;
-    assert!(matches!(run(&d, &[], crc()), Err(AttosError::ChecksumMismatch { .. })));
+    assert!(matches!(
+        run(&d, &[], crc()),
+        Err(AttosError::ChecksumMismatch { .. })
+    ));
 }
 
 #[test]
 fn header_corruption() {
     let data = std::fs::read(golden("golden_v2_lz4b16_1000.attos")).unwrap();
-    let keys: Vec<Vec<u8>> = rows("golden_v2_1000").into_iter().map(|r| r.0).take(100).collect();
+    let keys: Vec<Vec<u8>> = rows("golden_v2_1000")
+        .into_iter()
+        .map(|r| r.0)
+        .take(100)
+        .collect();
     let corrupt = |name: &str, f: &dyn Fn(&mut Vec<u8>)| {
         let mut d = data.clone();
         f(&mut d);
@@ -147,9 +170,17 @@ fn header_corruption() {
 
 #[test]
 fn truncation_and_random_flips_never_panic() {
-    for file in ["golden_v2_lz4b16_1000", "golden_v2_lz4b1_1000", "golden_v2_lz4b256_1000"] {
+    for file in [
+        "golden_v2_lz4b16_1000",
+        "golden_v2_lz4b1_1000",
+        "golden_v2_lz4b256_1000",
+    ] {
         let data = std::fs::read(golden(&format!("{file}.attos"))).unwrap();
-        let keys: Vec<Vec<u8>> = rows("golden_v2_1000").into_iter().map(|r| r.0).take(150).collect();
+        let keys: Vec<Vec<u8>> = rows("golden_v2_1000")
+            .into_iter()
+            .map(|r| r.0)
+            .take(150)
+            .collect();
         let mut cuts: Vec<usize> = (0..data.len().min(150)).collect();
         cuts.extend((1..40).map(|i| data.len() * i / 40));
         cuts.extend([data.len() - 1, data.len() - 4, data.len() - 5]);

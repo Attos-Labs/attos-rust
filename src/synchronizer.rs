@@ -7,11 +7,13 @@
 //! that thread over channels.
 use crate::error::AttosError;
 use crate::map::{AttosMap, OpenConfig};
+use crate::redirect::{same_origin_host, RedirectPolicy};
 use crate::sync::AttosClient;
 use crate::telemetry::{
     now_ms, report_body, Report, TelemetryState, TelemetryStats, DEFAULT_TELEMETRY_INTERVAL,
     TELEMETRY_429_PAUSE, TELEMETRY_QUEUE,
 };
+use reqwest::Url;
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -22,8 +24,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc as stdmpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use reqwest::Url;
-use crate::redirect::{same_origin_host, RedirectPolicy};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -84,7 +84,11 @@ pub struct SyncConfig {
 }
 
 impl SyncConfig {
-    pub fn new(base_url: impl Into<String>, api_key: impl Into<String>, dataset_id: impl Into<String>) -> Self {
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        dataset_id: impl Into<String>,
+    ) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
@@ -98,7 +102,11 @@ impl SyncConfig {
             telemetry_base_url: None,
             telemetry_api_key: None,
             http_timeout: Duration::from_secs(600),
-            telemetry_retry_delays: vec![Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(4)],
+            telemetry_retry_delays: vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+            ],
             backoff_base: Duration::from_secs(1),
             delta: true,
             redirect: true,
@@ -186,13 +194,25 @@ pub fn uuid_v4() -> String {
     for (i, chunk) in b.chunks_mut(8).enumerate() {
         let mut h = RandomState::new().build_hasher();
         h.write_usize(i);
-        h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+        h.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        );
         chunk.copy_from_slice(&h.finish().to_le_bytes());
     }
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
     let h: String = b.iter().map(|x| format!("{:02x}", x)).collect();
-    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
 }
 
 /// Exponential back-off 1 s·2^k with ±20 % jitter, capped at min(interval, 5 min).
@@ -254,9 +274,14 @@ pub fn next_delay_with(
             jitter_interval(interval, r1)
         }
         Err(AttosError::HttpStatus { code, retry_after }) if *code == 402 || *code == 429 => {
-            let d = retry_after.map(|d| d.min(MAX_RETRY_AFTER)).unwrap_or(QUOTA_PAUSE);
+            let d = retry_after
+                .map(|d| d.min(MAX_RETRY_AFTER))
+                .unwrap_or(QUOTA_PAUSE);
             let d = d + d.mul_f64(0.2 * r1);
-            warn!("quota/node limit ({}); sync paused for {:?}, serving local data", code, d);
+            warn!(
+                "quota/node limit ({}); sync paused for {:?}, serving local data",
+                code, d
+            );
             d
         }
         Err(AttosError::HttpStatus { code, .. }) if (400..500).contains(code) => {
@@ -269,7 +294,10 @@ pub fn next_delay_with(
         Err(e) => {
             let d = transient_backoff_with(*failures, interval, base, r2);
             *failures += 1;
-            warn!("sync failed ({}); keeping current data, retrying in {:?}", e, d);
+            warn!(
+                "sync failed ({}); keeping current data, retrying in {:?}",
+                e, d
+            );
             d
         }
     }
@@ -287,7 +315,10 @@ impl AttosSynchronizer {
     pub fn start(cfg: SyncConfig) -> Result<Self, AttosError> {
         let node_id = cfg.node_id.clone().unwrap_or_else(default_node_id);
         if node_id.is_empty() || node_id.len() > 128 {
-            return Err(AttosError::Config(format!("node id must be 1-128 chars, got {}", node_id.len())));
+            return Err(AttosError::Config(format!(
+                "node id must be 1-128 chars, got {}",
+                node_id.len()
+            )));
         }
         if cfg.dataset_id.is_empty() {
             return Err(AttosError::Config("dataset_id is required".into()));
@@ -295,7 +326,9 @@ impl AttosSynchronizer {
         fs::create_dir_all(&cfg.cache_dir)?;
         let policy = RedirectPolicy::new(
             &cfg.redirect_hosts,
-            std::env::var(crate::redirect::REDIRECT_HOSTS_ENV).ok().as_deref(),
+            std::env::var(crate::redirect::REDIRECT_HOSTS_ENV)
+                .ok()
+                .as_deref(),
             cfg.test_redirect_any_target,
         );
         let inner = Arc::new(Inner {
@@ -321,7 +354,10 @@ impl AttosSynchronizer {
         let handle = std::thread::Builder::new()
             .name("attos-sync".into())
             .spawn(move || {
-                let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
                     Ok(rt) => rt,
                     Err(e) => {
                         let _ = ready_tx.send(Err(AttosError::IoError(e)));
@@ -331,7 +367,12 @@ impl AttosSynchronizer {
                 rt.block_on(run(inner2, cmd_rx, ready_tx));
             })?;
         match ready_rx.recv() {
-            Ok(Ok(client)) => Ok(Self { client, inner, cmd: cmd_tx, thread: Mutex::new(Some(handle)) }),
+            Ok(Ok(client)) => Ok(Self {
+                client,
+                inner,
+                cmd: cmd_tx,
+                thread: Mutex::new(Some(handle)),
+            }),
             Ok(Err(e)) => {
                 let _ = handle.join();
                 Err(e)
@@ -357,7 +398,9 @@ impl AttosSynchronizer {
     /// Run one sync attempt now (blocks the calling thread until it finishes).
     pub fn sync_now(&self) -> Result<SyncOutcome, AttosError> {
         let (tx, rx) = stdmpsc::channel();
-        self.cmd.send(Cmd::Sync(tx)).map_err(|_| AttosError::MapClosed)?;
+        self.cmd
+            .send(Cmd::Sync(tx))
+            .map_err(|_| AttosError::MapClosed)?;
         rx.recv().map_err(|_| AttosError::MapClosed)?
     }
 
@@ -390,12 +433,18 @@ impl AttosSynchronizer {
     }
     /// `(applied, fallbacks)`: syncs completed from a patch, and patches that failed and fell back to a full blob.
     pub fn delta_stats(&self) -> (u64, u64) {
-        (self.inner.delta_applied.load(Ordering::Relaxed), self.inner.delta_fallbacks.load(Ordering::Relaxed))
+        (
+            self.inner.delta_applied.load(Ordering::Relaxed),
+            self.inner.delta_fallbacks.load(Ordering::Relaxed),
+        )
     }
     /// `(redirected, fallbacks)`: syncs completed from a signed URL, and signed downloads that failed and were
     /// repeated through the sync endpoint.
     pub fn redirect_stats(&self) -> (u64, u64) {
-        (self.inner.redirected.load(Ordering::Relaxed), self.inner.redirect_fallbacks.load(Ordering::Relaxed))
+        (
+            self.inner.redirected.load(Ordering::Relaxed),
+            self.inner.redirect_fallbacks.load(Ordering::Relaxed),
+        )
     }
 
     /// Stop the background thread and unmap all data (waits for readers up to 5 s).
@@ -452,7 +501,11 @@ async fn run(
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     ready: stdmpsc::Sender<Result<AttosClient, AttosError>>,
 ) {
-    let http = match reqwest::Client::builder().timeout(inner.cfg.http_timeout).redirect(reqwest::redirect::Policy::none()).build() {
+    let http = match reqwest::Client::builder()
+        .timeout(inner.cfg.http_timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
         Ok(c) => c,
         Err(e) => {
             let _ = ready.send(Err(AttosError::Transport(e.to_string())));
@@ -508,7 +561,8 @@ async fn run(
     let (tel_tx, tel_rx) = mpsc::channel::<Report>(TELEMETRY_QUEUE);
     let tel_on = !inner.cfg.telemetry_interval.is_zero();
     if tel_on {
-        *inner.tel.window.lock().unwrap() = (client.lookups(), inner.crc_errors.load(Ordering::Relaxed));
+        *inner.tel.window.lock().unwrap() =
+            (client.lookups(), inner.crc_errors.load(Ordering::Relaxed));
         tokio::spawn(sender(inner.clone(), http.clone(), tel_rx));
     }
     let mut tel_tick = tokio::time::interval_at(
@@ -520,7 +574,13 @@ async fn run(
     let interval = inner.cfg.poll_interval;
     let mut failures = 0u32;
     let mut logged = HashSet::new();
-    let mut delay = next_delay(&first, &mut failures, interval, inner.cfg.backoff_base, &mut logged);
+    let mut delay = next_delay(
+        &first,
+        &mut failures,
+        interval,
+        inner.cfg.backoff_base,
+        &mut logged,
+    );
     let far = Duration::from_secs(86400 * 365);
     loop {
         let sleep = tokio::time::sleep(if interval.is_zero() { far } else { delay });
@@ -540,11 +600,18 @@ async fn run(
             }
         }
         let r = sync_once(&inner, &http, &mut client_opt).await;
-        delay = next_delay(&r, &mut failures, interval, inner.cfg.backoff_base, &mut logged);
+        delay = next_delay(
+            &r,
+            &mut failures,
+            interval,
+            inner.cfg.backoff_base,
+            &mut logged,
+        );
     }
 }
 
 /// Where a download is written: the temp file, or a gzip decoder in front of it.
+#[allow(clippy::large_enum_variant)] // one short-lived value per download
 enum Sink {
     Raw(fs::File),
     Gzip(flate2::write::GzDecoder<fs::File>),
@@ -562,9 +629,9 @@ impl Sink {
     fn finish(self) -> Result<fs::File, AttosError> {
         match self {
             Sink::Raw(f) => Ok(f),
-            Sink::Gzip(d) => d
-                .finish()
-                .map_err(|e| AttosError::Transport(format!("truncated or corrupt gzip download: {}", e))),
+            Sink::Gzip(d) => d.finish().map_err(|e| {
+                AttosError::Transport(format!("truncated or corrupt gzip download: {}", e))
+            }),
         }
     }
 }
@@ -625,7 +692,8 @@ async fn sync_once(
                 inner.redirect_fallbacks.fetch_add(1, Ordering::Relaxed);
                 // Stop asking for a while: a node that cannot reach the download host would otherwise be handed
                 // a URL, fail, and stream the same bytes through the endpoint on every sync, billed twice each time.
-                *inner.redirect_off.lock().unwrap() = Some(Instant::now() + inner.cfg.redirect_cooldown);
+                *inner.redirect_off.lock().unwrap() =
+                    Some(Instant::now() + inner.cfg.redirect_cooldown);
                 warn!("signed download failed ({}); fetching through the sync endpoint, no redirects for {:?}", e, inner.cfg.redirect_cooldown);
                 allow_redirect = false;
             }
@@ -639,8 +707,13 @@ async fn sync_once(
     }
 }
 
+#[allow(clippy::unnecessary_map_or)] // is_none_or needs a newer MSRV
 fn redirect_allowed_now(inner: &Inner) -> bool {
-    inner.redirect_off.lock().unwrap().map_or(true, |t| Instant::now() >= t)
+    inner
+        .redirect_off
+        .lock()
+        .unwrap()
+        .map_or(true, |t| Instant::now() >= t)
 }
 
 /// Builds the sync GET. `creds` = false drops the API key and node id (a redirect to another host).
@@ -656,9 +729,18 @@ fn sync_request(
     let mut req = http
         .get(url)
         .header("User-Agent", format!("attos-rust/{}", crate::VERSION))
-        .header("Accept-Encoding", if inner.cfg.compression { "gzip" } else { "identity" });
+        .header(
+            "Accept-Encoding",
+            if inner.cfg.compression {
+                "gzip"
+            } else {
+                "identity"
+            },
+        );
     if creds {
-        req = req.header("X-API-Key", &inner.cfg.api_key).header("X-Attos-Node-ID", &inner.node_id);
+        req = req
+            .header("X-API-Key", &inner.cfg.api_key)
+            .header("X-Attos-Node-ID", &inner.node_id);
     }
     if have_blob {
         if let Some(e) = inner.etag.lock().unwrap().clone() {
@@ -693,22 +775,40 @@ async fn send_sync(
     allow_delta: bool,
     allow_redirect: bool,
 ) -> Result<reqwest::Response, AttosError> {
-    let first = Url::parse(&format!("{}/api/v1/datasets/sync/{}", inner.cfg.base_url, inner.cfg.dataset_id))
-        .map_err(|e| AttosError::Config(format!("invalid base_url: {}", e)))?;
+    let first = Url::parse(&format!(
+        "{}/api/v1/datasets/sync/{}",
+        inner.cfg.base_url, inner.cfg.dataset_id
+    ))
+    .map_err(|e| AttosError::Config(format!("invalid base_url: {}", e)))?;
     let mut cur = first.clone();
     for _ in 0..=MAX_ORDINARY_REDIRECTS {
         let creds = same_origin_host(&cur, &first);
-        let resp = sync_request(inner, http, cur.as_str(), creds, have_blob, allow_delta, allow_redirect)
-            .send()
-            .await
-            .map_err(|e| AttosError::Transport(e.to_string()))?;
+        let resp = sync_request(
+            inner,
+            http,
+            cur.as_str(),
+            creds,
+            have_blob,
+            allow_delta,
+            allow_redirect,
+        )
+        .send()
+        .await
+        .map_err(|e| AttosError::Transport(e.to_string()))?;
         let st = resp.status();
         if !st.is_redirection() || resp.headers().contains_key(SIGNED_LENGTH_HEADER) {
             return Ok(resp);
         }
-        let Some(loc) = hv(resp.headers(), "location") else { return Ok(resp) };
-        let next = cur.join(&loc).map_err(|e| AttosError::Transport(format!("bad redirect location: {}", e)))?;
-        inner.policy.allows_ordinary(&next, &first).map_err(AttosError::Transport)?;
+        let Some(loc) = hv(resp.headers(), "location") else {
+            return Ok(resp);
+        };
+        let next = cur
+            .join(&loc)
+            .map_err(|e| AttosError::Transport(format!("bad redirect location: {}", e)))?;
+        inner
+            .policy
+            .allows_ordinary(&next, &first)
+            .map_err(AttosError::Transport)?;
         cur = next;
     }
     Err(AttosError::Transport("stopped after 10 redirects".into()))
@@ -716,7 +816,11 @@ async fn send_sync(
 
 /// Downloads the object behind a signed redirect. The request is built from scratch: no X-API-Key,
 /// Authorization or node id, and the download itself is never redirected again.
-async fn fetch_redirect(inner: &Inner, http: &reqwest::Client, r302: reqwest::Response) -> Result<Effective, AttosError> {
+async fn fetch_redirect(
+    inner: &Inner,
+    http: &reqwest::Client,
+    r302: reqwest::Response,
+) -> Result<Effective, AttosError> {
     let t = |m: String| AttosError::Transport(m);
     let loc = hv(r302.headers(), "location").unwrap_or_default();
     let u = Url::parse(&loc).map_err(|e| t(format!("unusable redirect target: {}", e)))?;
@@ -732,11 +836,17 @@ async fn fetch_redirect(inner: &Inner, http: &reqwest::Client, r302: reqwest::Re
         .await
         .map_err(|e| t(format!("signed download: {}", e)))?;
     if resp.status().as_u16() != 200 {
-        return Err(t(format!("signed download: HTTP {}", resp.status().as_u16())));
+        return Err(t(format!(
+            "signed download: HTTP {}",
+            resp.status().as_u16()
+        )));
     }
     if let Some(cl) = resp.content_length() {
         if cl != declared {
-            return Err(t(format!("signed download: {} bytes, expected {}", cl, declared)));
+            return Err(t(format!(
+                "signed download: {} bytes, expected {}",
+                cl, declared
+            )));
         }
     }
     let mut headers = r302.headers().clone();
@@ -745,7 +855,12 @@ async fn fetch_redirect(inner: &Inner, http: &reqwest::Client, r302: reqwest::Re
     if let Some(enc) = headers.get(SIGNED_ENCODING_HEADER).cloned() {
         headers.insert("content-encoding", enc);
     }
-    Ok(Effective { headers, body: resp, declared: Some(declared), redirected: true })
+    Ok(Effective {
+        headers,
+        body: resp,
+        declared: Some(declared),
+        redirected: true,
+    })
 }
 
 /// One conditional GET; on 200 install the blob (or rebuild it from a patch) per the §4 swap invariant.
@@ -759,14 +874,28 @@ async fn sync_attempt(
     let resp = send_sync(inner, http, client.is_some(), allow_delta, allow_redirect).await?;
     // A signed redirect: the bytes come from a short-lived URL, fetched WITHOUT any credential header;
     // everything else about the response is read from this 302.
-    let mut eff = if resp.status().as_u16() == 302 && resp.headers().contains_key(SIGNED_LENGTH_HEADER) {
-        fetch_redirect(inner, http, resp).await.map_err(Fail::Redirect)?
-    } else {
-        Effective { headers: resp.headers().clone(), declared: resp.content_length(), body: resp, redirected: false }
-    };
+    let mut eff =
+        if resp.status().as_u16() == 302 && resp.headers().contains_key(SIGNED_LENGTH_HEADER) {
+            fetch_redirect(inner, http, resp)
+                .await
+                .map_err(Fail::Redirect)?
+        } else {
+            Effective {
+                headers: resp.headers().clone(),
+                declared: resp.content_length(),
+                body: resp,
+                redirected: false,
+            }
+        };
     let redirected = eff.redirected;
     // A failure while handling redirected bytes is a redirect failure.
-    let fail = move |e: AttosError| if redirected { Fail::Redirect(e) } else { Fail::Other(e) };
+    let fail = move |e: AttosError| {
+        if redirected {
+            Fail::Redirect(e)
+        } else {
+            Fail::Other(e)
+        }
+    };
     let status = eff.body.status().as_u16();
     if !redirected {
         if status == 304 {
@@ -778,7 +907,11 @@ async fn sync_attempt(
             } else {
                 None
             };
-            return Err(AttosError::HttpStatus { code: status, retry_after }.into());
+            return Err(AttosError::HttpStatus {
+                code: status,
+                retry_after,
+            }
+            .into());
         }
     }
     let new_etag = hv(&eff.headers, "etag");
@@ -788,29 +921,46 @@ async fn sync_attempt(
     let gzip = match hv(&eff.headers, "content-encoding").as_deref() {
         None | Some("identity") => false,
         Some("gzip") => true,
-        Some(other) => return Err(fail(AttosError::Transport(format!("unsupported Content-Encoding {:?}", other)))),
+        Some(other) => {
+            return Err(fail(AttosError::Transport(format!(
+                "unsupported Content-Encoding {:?}",
+                other
+            ))))
+        }
     };
     if is_patch && gzip {
-        return Err(Fail::Delta(AttosError::Transport("unsupported Content-Encoding on a patch".into())));
+        return Err(Fail::Delta(AttosError::Transport(
+            "unsupported Content-Encoding on a patch".into(),
+        )));
     }
 
     // Download to a temp file in the same directory as the live blob.
     let rnd = || RandomState::new().build_hasher().finish();
-    let tmp = inner.cfg.cache_dir.join(format!("{}{:016x}", temp_prefix(inner), rnd()));
+    let tmp = inner
+        .cfg
+        .cache_dir
+        .join(format!("{}{:016x}", temp_prefix(inner), rnd()));
     let mut guard = TempGuard(Some(tmp.clone()));
     let mut patch_guard = TempGuard(None);
     // Compressed sync (CONTRACTS §4): a gzip body is decompressed while it is written. Content-Length counts
     // wire bytes; an incomplete or corrupted gzip stream fails its trailer check, and the decompressed blob
     // still gets the full validation (CRC32) below. A patch goes to its own temp file first.
     let dl_path = if is_patch {
-        let p = inner.cfg.cache_dir.join(format!("{}patch-{:016x}", temp_prefix(inner), rnd()));
+        let p = inner
+            .cfg
+            .cache_dir
+            .join(format!("{}patch-{:016x}", temp_prefix(inner), rnd()));
         patch_guard.0 = Some(p.clone());
         p
     } else {
         tmp.clone()
     };
     let file = fs::File::create(&dl_path)?;
-    let mut out = if gzip { Sink::Gzip(flate2::write::GzDecoder::new(file)) } else { Sink::Raw(file) };
+    let mut out = if gzip {
+        Sink::Gzip(flate2::write::GzDecoder::new(file))
+    } else {
+        Sink::Raw(file)
+    };
     let mut written: u64 = 0;
     loop {
         match eff.body.chunk().await {
@@ -819,19 +969,30 @@ async fn sync_attempt(
                 // Never take more than one byte past the declared size of a signed download.
                 if let (true, Some(d)) = (redirected, eff.declared) {
                     if written > d {
-                        return Err(fail(AttosError::Transport(format!("signed download larger than the declared {} bytes", d))));
+                        return Err(fail(AttosError::Transport(format!(
+                            "signed download larger than the declared {} bytes",
+                            d
+                        ))));
                     }
                 }
                 out.write_all(&c)
                     .map_err(|e| fail(AttosError::Transport(format!("corrupt download: {}", e))))?;
             }
             Ok(None) => break,
-            Err(e) => return Err(fail(AttosError::Transport(format!("download interrupted: {}", e)))),
+            Err(e) => {
+                return Err(fail(AttosError::Transport(format!(
+                    "download interrupted: {}",
+                    e
+                ))))
+            }
         }
     }
     if let Some(cl) = eff.declared {
         if cl != written {
-            return Err(fail(AttosError::Transport(format!("truncated download: {} of {} bytes", written, cl))));
+            return Err(fail(AttosError::Transport(format!(
+                "truncated download: {} of {} bytes",
+                written, cl
+            ))));
         }
     }
     let f = out.finish().map_err(fail)?;
@@ -841,7 +1002,11 @@ async fn sync_attempt(
     if is_patch {
         let rebuilt = rebuild_from_patch(inner, &eff.headers, &dl_path, &tmp);
         if let Err(e) = rebuilt {
-            return Err(if redirected { Fail::Redirect(e) } else { Fail::Delta(e) });
+            return Err(if redirected {
+                Fail::Redirect(e)
+            } else {
+                Fail::Delta(e)
+            });
         }
         drop(patch_guard);
     }
@@ -849,7 +1014,14 @@ async fn sync_attempt(
     // Signed artifacts: the signature covers the SHA-256 of the complete plain file, however it arrived.
     if !inner.cfg.signature_keys.is_empty() {
         let sig = hv(&eff.headers, "x-attos-signature");
-        if let Err(e) = file_digest(&tmp).and_then(|d| crate::signature::verify(&inner.cfg.signature_keys, &inner.cfg.dataset_id, sig.as_deref(), &d)) {
+        if let Err(e) = file_digest(&tmp).and_then(|d| {
+            crate::signature::verify(
+                &inner.cfg.signature_keys,
+                &inner.cfg.dataset_id,
+                sig.as_deref(),
+                &d,
+            )
+        }) {
             inner.sig_errors.fetch_add(1, Ordering::Relaxed);
             return Err(if is_patch { Fail::Delta(e) } else { fail(e) });
         }
@@ -867,7 +1039,12 @@ async fn sync_attempt(
     fs::rename(&tmp, live_path(inner))?;
     guard.0 = None;
     if !inner.cfg.signature_keys.is_empty() {
-        write_sig(inner, hv(&eff.headers, "x-attos-signature").as_deref().unwrap_or(""));
+        write_sig(
+            inner,
+            hv(&eff.headers, "x-attos-signature")
+                .as_deref()
+                .unwrap_or(""),
+        );
     }
     if let Ok(d) = fs::File::open(&inner.cfg.cache_dir) {
         let _ = d.sync_all();
@@ -876,7 +1053,12 @@ async fn sync_attempt(
         Some(c) => c.swap_map(map)?,
         None => *client = Some(AttosClient::new(map, inner.cfg.open)),
     }
-    info!("hot-swapped dataset {} ({} bytes{})", inner.cfg.dataset_id, written, if is_patch { ", patch" } else { "" });
+    info!(
+        "hot-swapped dataset {} ({} bytes{})",
+        inner.cfg.dataset_id,
+        written,
+        if is_patch { ", patch" } else { "" }
+    );
     if is_patch {
         inner.delta_applied.fetch_add(1, Ordering::Relaxed);
     }
@@ -927,7 +1109,10 @@ fn write_sig(i: &Inner, header: &str) {
         use std::os::unix::fs::OpenOptionsExt;
         o.mode(0o600);
     }
-    if let Err(e) = o.open(sig_path(i)).and_then(|mut f| f.write_all(header.as_bytes())) {
+    if let Err(e) = o
+        .open(sig_path(i))
+        .and_then(|mut f| f.write_all(header.as_bytes()))
+    {
         warn!("could not persist signature: {}", e);
     }
 }
@@ -953,7 +1138,12 @@ fn verify_cached(i: &Inner, live: &std::path::Path) -> Result<(), AttosError> {
         return Ok(());
     }
     let hdr = fs::read_to_string(sig_path(i)).map_err(|_| AttosError::SignatureMissing)?;
-    crate::signature::verify(&i.cfg.signature_keys, &i.cfg.dataset_id, Some(hdr.trim()), &file_digest(live)?)
+    crate::signature::verify(
+        &i.cfg.signature_keys,
+        &i.cfg.dataset_id,
+        Some(hdr.trim()),
+        &file_digest(live)?,
+    )
 }
 
 /// Rebuilds the new blob into `dst` from the live file and the downloaded patch (`patch_path`). The patch's
@@ -965,12 +1155,16 @@ fn rebuild_from_patch(
     dst: &std::path::Path,
 ) -> Result<(), AttosError> {
     let mut have = inner.etag.lock().unwrap().clone().unwrap_or_default();
-    if let Some(raw) = have.strip_suffix("-gzip\"") { // the raw tag of the same version
+    if let Some(raw) = have.strip_suffix("-gzip\"") {
+        // the raw tag of the same version
         have = format!("{}\"", raw);
     }
     let base_tag = hv(headers, "x-attos-delta-base-etag").unwrap_or_default();
     if base_tag != have {
-        return Err(AttosError::Transport(format!("patch is for base {}, this node has {}", base_tag, have)));
+        return Err(AttosError::Transport(format!(
+            "patch is for base {}, this node has {}",
+            base_tag, have
+        )));
     }
     let live = fs::File::open(live_path(inner))?;
     // SAFETY: the live file is replaced only by an atomic rename of a fresh file, never written in place.
@@ -979,10 +1173,14 @@ fn rebuild_from_patch(
     let mut w = std::io::BufWriter::with_capacity(1 << 16, fs::File::create(dst)?);
     let sha = crate::delta::apply_delta(&mut w, &base, patch)?;
     w.flush()?;
-    w.into_inner().map_err(|e| AttosError::IoError(e.into_error()))?.sync_all()?;
+    w.into_inner()
+        .map_err(|e| AttosError::IoError(e.into_error()))?
+        .sync_all()?;
     if let Some(want) = hv(headers, "x-attos-delta-target-sha256") {
         if !want.is_empty() && crate::sha256::hex(&sha) != want.to_ascii_lowercase() {
-            return Err(crate::delta::corrupt("target SHA-256 differs from the server's header"));
+            return Err(crate::delta::corrupt(
+                "target SHA-256 differs from the server's header",
+            ));
         }
     }
     Ok(())
@@ -1012,15 +1210,29 @@ fn enqueue(inner: &Inner, client: &AttosClient, tx: &mpsc::Sender<Report>) {
         d_crc,
         dropped,
     );
-    if tx.try_send(Report { body, dropped_carried: dropped }).is_err() {
+    if tx
+        .try_send(Report {
+            body,
+            dropped_carried: dropped,
+        })
+        .is_err()
+    {
         inner.tel.dropped.fetch_add(1 + dropped, Ordering::Relaxed);
     }
 }
 
 async fn sender(inner: Arc<Inner>, http: reqwest::Client, mut rx: mpsc::Receiver<Report>) {
-    let base = inner.cfg.telemetry_base_url.clone().unwrap_or_else(|| inner.cfg.base_url.clone());
+    let base = inner
+        .cfg
+        .telemetry_base_url
+        .clone()
+        .unwrap_or_else(|| inner.cfg.base_url.clone());
     let url = format!("{}/api/v1/telemetry/report", base.trim_end_matches('/'));
-    let key = inner.cfg.telemetry_api_key.clone().unwrap_or_else(|| inner.cfg.api_key.clone());
+    let key = inner
+        .cfg
+        .telemetry_api_key
+        .clone()
+        .unwrap_or_else(|| inner.cfg.api_key.clone());
     while let Some(r) = rx.recv().await {
         let until = inner.tel.pause_until_ms.load(Ordering::Relaxed);
         let now = now_ms();
@@ -1028,7 +1240,10 @@ async fn sender(inner: Arc<Inner>, http: reqwest::Client, mut rx: mpsc::Receiver
             tokio::time::sleep(Duration::from_millis(until - now)).await;
         }
         if !deliver(&inner, &http, &url, &key, &r.body).await {
-            inner.tel.dropped.fetch_add(1 + r.dropped_carried, Ordering::Relaxed);
+            inner
+                .tel
+                .dropped
+                .fetch_add(1 + r.dropped_carried, Ordering::Relaxed);
         }
     }
 }
@@ -1053,7 +1268,8 @@ async fn deliver(inner: &Inner, http: &reqwest::Client, url: &str, key: &str, bo
                 return true;
             }
             Ok(r) if r.status().as_u16() == 429 => {
-                let d = parse_retry_after(r.headers().get("retry-after")).unwrap_or(TELEMETRY_429_PAUSE);
+                let d = parse_retry_after(r.headers().get("retry-after"))
+                    .unwrap_or(TELEMETRY_429_PAUSE);
                 inner
                     .tel
                     .pause_until_ms
@@ -1066,7 +1282,11 @@ async fn deliver(inner: &Inner, http: &reqwest::Client, url: &str, key: &str, bo
             }
             other => {
                 if attempt >= delays.len() {
-                    warn!("telemetry send failed after {} attempts (dropped): {:?}", attempt + 1, other.map(|r| r.status()));
+                    warn!(
+                        "telemetry send failed after {} attempts (dropped): {:?}",
+                        attempt + 1,
+                        other.map(|r| r.status())
+                    );
                     return false;
                 }
                 tokio::time::sleep(delays[attempt]).await;
@@ -1082,8 +1302,14 @@ mod node_id_tests {
 
     #[test]
     fn precedence_and_limits() {
-        assert_eq!(node_id_from(Some(" pod-1 ".into()), Some("host".into())), "pod-1");
-        assert_eq!(node_id_from(None, Some("web-7.internal".into())), "web-7.internal");
+        assert_eq!(
+            node_id_from(Some(" pod-1 ".into()), Some("host".into())),
+            "pod-1"
+        );
+        assert_eq!(
+            node_id_from(None, Some("web-7.internal".into())),
+            "web-7.internal"
+        );
         assert_eq!(node_id_from(Some("  ".into()), Some("host".into())), "host");
         assert_eq!(node_id_from(None, None).len(), 36);
         assert_eq!(node_id_from(Some("x".repeat(300)), None).len(), 128);

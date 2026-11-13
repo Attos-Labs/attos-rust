@@ -12,11 +12,15 @@ const CASES: &[(&str, &str, usize, bool)] = &[
 ];
 
 fn golden(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden").join(name)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden")
+        .join(name)
 }
 
 fn unhex(s: &str) -> Vec<u8> {
-    (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+        .collect()
 }
 
 fn rows(stem: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -32,7 +36,10 @@ fn rows(stem: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 fn crc() -> OpenConfig {
-    OpenConfig { validate_checksum: true, ..Default::default() }
+    OpenConfig {
+        validate_checksum: true,
+        ..Default::default()
+    }
 }
 
 #[test]
@@ -54,9 +61,15 @@ fn every_row_of_every_lean_golden() {
             }
             let mut absent = k.clone();
             absent.push(b'x');
-            assert!(matches!(map.get_owned(&absent), Err(AttosError::KeyNotFound)), "{file}");
+            assert!(
+                matches!(map.get_owned(&absent), Err(AttosError::KeyNotFound)),
+                "{file}"
+            );
             if !compressed {
-                assert!(matches!(map.get(&absent), Err(AttosError::KeyNotFound)), "{file}");
+                assert!(
+                    matches!(map.get(&absent), Err(AttosError::KeyNotFound)),
+                    "{file}"
+                );
             }
         }
         let mut seen = 0;

@@ -11,7 +11,11 @@ use reqwest::Url;
 pub const REDIRECT_HOSTS_ENV: &str = "ATTOS_REDIRECT_HOSTS";
 
 /// Google Cloud Storage (path-style and virtual-hosted) and the Attos download CDN (exact host).
-const DEFAULT_HOSTS: [&str; 3] = ["storage.googleapis.com", "*.storage.googleapis.com", "dl.attoscloud.com"];
+const DEFAULT_HOSTS: [&str; 3] = [
+    "storage.googleapis.com",
+    "*.storage.googleapis.com",
+    "dl.attoscloud.com",
+];
 
 #[derive(Debug, Clone)]
 pub(crate) struct RedirectPolicy {
@@ -22,7 +26,11 @@ pub(crate) struct RedirectPolicy {
 
 fn normalize(h: &str) -> Option<String> {
     let h = h.trim().to_ascii_lowercase();
-    if h.is_empty() || h.contains(['/', '@', ':', '?', '#', '%', ' ', '\t']) || h.starts_with('.') || h.ends_with('.') {
+    if h.is_empty()
+        || h.contains(['/', '@', ':', '?', '#', '%', ' ', '\t'])
+        || h.starts_with('.')
+        || h.ends_with('.')
+    {
         return None;
     }
     if let Some(rest) = h.strip_prefix("*.") {
@@ -35,7 +43,11 @@ fn normalize(h: &str) -> Option<String> {
 impl RedirectPolicy {
     /// `extra` entries come from `SyncConfig::redirect_hosts`; `ATTOS_REDIRECT_HOSTS` is added to them.
     pub(crate) fn new(extra: &[String], env: Option<&str>, any_target: bool) -> Self {
-        let from_env = env.unwrap_or("").split(',').map(str::to_string).collect::<Vec<_>>();
+        let from_env = env
+            .unwrap_or("")
+            .split(',')
+            .map(str::to_string)
+            .collect::<Vec<_>>();
         let hosts = DEFAULT_HOSTS
             .iter()
             .map(|s| s.to_string())
@@ -70,10 +82,22 @@ impl RedirectPolicy {
         }
         let host = match u.host() {
             Some(url::Host::Domain(d)) => d.to_ascii_lowercase(),
-            _ => return Err(format!("redirect target {} is not an allowed host", redact(u))),
+            _ => {
+                return Err(format!(
+                    "redirect target {} is not an allowed host",
+                    redact(u)
+                ))
+            }
         };
-        if host.ends_with('.') || !host.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'.') {
-            return Err(format!("redirect target {} is not an allowed host", redact(u)));
+        if host.ends_with('.')
+            || !host
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'.')
+        {
+            return Err(format!(
+                "redirect target {} is not an allowed host",
+                redact(u)
+            ));
         }
         for pat in &self.hosts {
             match pat.strip_prefix("*.") {
@@ -89,7 +113,10 @@ impl RedirectPolicy {
                 }
             }
         }
-        Err(format!("redirect host {:?} is not in the allowed list (set {} or SyncConfig::redirect_hosts)", host, REDIRECT_HOSTS_ENV))
+        Err(format!(
+            "redirect host {:?} is not in the allowed list (set {} or SyncConfig::redirect_hosts)",
+            host, REDIRECT_HOSTS_ENV
+        ))
     }
 
     /// Whether an ordinary (unmarked) redirect of the sync request may be followed: never a downgrade from
@@ -131,10 +158,17 @@ mod tests {
     use super::*;
 
     fn p() -> RedirectPolicy {
-        let extra: Vec<String> = ["dl.example.com", "*.cdn.example.net", "BAD/HOST", "*.com", "x*y.com", ""]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let extra: Vec<String> = [
+            "dl.example.com",
+            "*.cdn.example.net",
+            "BAD/HOST",
+            "*.com",
+            "x*y.com",
+            "",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         RedirectPolicy::new(&extra, None, false)
     }
 
@@ -195,20 +229,37 @@ mod tests {
     #[test]
     fn env_hosts_and_test_escape() {
         let q = RedirectPolicy::new(&[], Some("cdn.acme.io, *.edge.acme.io"), false);
-        assert!(q.check(&Url::parse("https://cdn.acme.io/o").unwrap()).is_ok());
-        assert!(q.check(&Url::parse("https://a.edge.acme.io/o").unwrap()).is_ok());
+        assert!(q
+            .check(&Url::parse("https://cdn.acme.io/o").unwrap())
+            .is_ok());
+        assert!(q
+            .check(&Url::parse("https://a.edge.acme.io/o").unwrap())
+            .is_ok());
         assert!(q.check(&Url::parse("https://acme.io/o").unwrap()).is_err());
         let any = RedirectPolicy::new(&[], None, true);
-        assert!(any.check(&Url::parse("http://127.0.0.1:9/o").unwrap()).is_ok());
+        assert!(any
+            .check(&Url::parse("http://127.0.0.1:9/o").unwrap())
+            .is_ok());
     }
 
     #[test]
     fn ordinary_redirects() {
         let first = Url::parse("https://api.attos.dev/api/v1/datasets/sync/x").unwrap();
         let q = p();
-        assert!(q.allows_ordinary(&Url::parse("https://api.attos.dev/other").unwrap(), &first).is_ok());
-        assert!(q.allows_ordinary(&Url::parse("http://api.attos.dev/other").unwrap(), &first).is_err());
-        assert!(q.allows_ordinary(&Url::parse("https://evil.com/x").unwrap(), &first).is_err());
-        assert!(q.allows_ordinary(&Url::parse("https://storage.googleapis.com/b/o").unwrap(), &first).is_ok());
+        assert!(q
+            .allows_ordinary(&Url::parse("https://api.attos.dev/other").unwrap(), &first)
+            .is_ok());
+        assert!(q
+            .allows_ordinary(&Url::parse("http://api.attos.dev/other").unwrap(), &first)
+            .is_err());
+        assert!(q
+            .allows_ordinary(&Url::parse("https://evil.com/x").unwrap(), &first)
+            .is_err());
+        assert!(q
+            .allows_ordinary(
+                &Url::parse("https://storage.googleapis.com/b/o").unwrap(),
+                &first
+            )
+            .is_ok());
     }
 }
