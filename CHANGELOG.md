@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+* Warm-up by default in the synchronizer: `OpenConfig::warm_up` reads every page of a newly mapped file before it is published (`SyncConfig::new` sets it; opt out with `config.open.warm_up = false`). Without it each hot swap maps a cold file and first-touch page faults added about 350 to 600 ns to P99 at 100k reads/s. Cost: resident memory equals the file size; the validation pass's pages are no longer dropped when warm-up is on. A direct `AttosMap::open` stays lazy.
+
 ## 1.4.0 - 2026-11-13
 
 * Signed artifacts (as in the Go SDK): `SyncConfig::signature_keys` (Ed25519 public keys by key id, `parse_public_key` accepts standard/URL-safe base64) enforces `X-Attos-Signature: alg=ed25519; kid=..; sig=..` over `"attos-artifact-v1\0" + datasetID + "\0" + SHA-256(file)`; downloads, rebuilt patches and the cached file (re-verified from `<dataset>.attos.sig`) fail closed, the current map keeps serving, `signature_errors()` counts rejects. New `AttosError::{SignatureMissing, SignatureInvalid}`.

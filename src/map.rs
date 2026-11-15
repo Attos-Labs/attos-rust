@@ -39,6 +39,13 @@ pub struct OpenConfig {
     /// Default: `false`.
     pub pin_to_memory: bool,
 
+    /// Read every page of the file into this process before the map is exposed, so the first lookups never
+    /// fault a page in. The synchronizer turns it on by default (`SyncConfig::new`): without it each hot swap
+    /// maps a cold file and, at 100k reads/s over a 1M-key file, first-touch page faults added about 350 to
+    /// 600 ns to P99. The cost is resident memory equal to the file size (without it, only pages that lookups
+    /// touch stay resident). Opt out with `warm_up = false`. Default for a direct `open`: `false`.
+    pub warm_up: bool,
+
     /// Polling interval for background cloud sync used by `AttosSynchronizer`.
     /// `None` selects the default (`DEFAULT_SYNC_INTERVAL`, 30 s, identical in all
     /// SDKs); `Some(Duration::ZERO)` disables polling.
@@ -204,6 +211,17 @@ fn parse_v2(data: &[u8], check_crc: bool) -> Result<V2Params, AttosError> {
     Ok(p)
 }
 
+/// Touches one byte per 4 KiB page so the whole mapping is resident (and mapped into this process) before use.
+fn warm_pages(m: &Mmap) {
+    #[cfg(unix)]
+    let _ = m.advise(memmap2::Advice::WillNeed);
+    let mut acc = 0u8;
+    for page in m.chunks(4096) {
+        acc = acc.wrapping_add(page[0]);
+    }
+    std::hint::black_box(acc); // keeps the loads from being optimised away
+}
+
 #[inline(always)]
 fn hash_key(key: &[u8]) -> u64 {
     let mut hasher = XxHash64::with_seed(0);
@@ -305,11 +323,18 @@ impl AttosMap {
         // does not count the whole file as resident. Skipped when pinning, as
         // mlock'd pages cannot be released and the caller asked for residency.
         #[cfg(target_os = "linux")]
-        if check_crc && !config.pin_to_memory {
+        if check_crc && !config.pin_to_memory && !config.warm_up {
             // SAFETY: read-only file-backed mapping; MADV_DONTNEED only drops
             // the process's page-table entries and later accesses refault
             // identical contents from the file.
             let _ = unsafe { mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
+        }
+
+        // Warm-up: fault every page into this process now (before the map is published), not on the first lookups.
+        // The CRC pass above already read the file; this also covers a map opened without it and re-maps pages
+        // that the kernel dropped from the page tables since.
+        if config.warm_up {
+            warm_pages(&mmap);
         }
 
         let mut pinned = false;

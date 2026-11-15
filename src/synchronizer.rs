@@ -97,7 +97,8 @@ impl SyncConfig {
             node_id: None,
             compression: true,
             poll_interval: DEFAULT_SYNC_INTERVAL,
-            open: OpenConfig::default(),
+            // Pre-fault newly mapped files before they are published (see OpenConfig::warm_up); opt out with open.warm_up = false.
+            open: OpenConfig { warm_up: true, ..OpenConfig::default() },
             telemetry_interval: DEFAULT_TELEMETRY_INTERVAL,
             telemetry_base_url: None,
             telemetry_api_key: None,
