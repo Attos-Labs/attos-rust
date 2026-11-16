@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.5.0 - 2026-11-16
 
 * Warm-up by default in the synchronizer: `OpenConfig::warm_up` reads every page of a newly mapped file before it is published (`SyncConfig::new` sets it; opt out with `config.open.warm_up = false`). Without it each hot swap maps a cold file and first-touch page faults added about 350 to 600 ns to P99 at 100k reads/s. Cost: resident memory equals the file size; the validation pass's pages are no longer dropped when warm-up is on. A direct `AttosMap::open` stays lazy.
 
