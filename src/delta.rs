@@ -507,4 +507,63 @@ mod tests {
         bad[n - 4..].copy_from_slice(&c.to_be_bytes());
         assert!(apply_delta(&mut Vec::new(), &base, &bad[..]).is_err());
     }
+
+    /// A v2 patch is one TRUNCATE_AND_APPEND op plus END; the v1 copy/add ops are not part of it, even when the rest of
+    /// the patch is valid (same rule in Go, Java, Node and Python).
+    #[test]
+    fn v2_patch_refuses_version_1_ops() {
+        let base = fx("v1_base.attos");
+        let good = fx("v1_to_v2_tail.patch");
+        let run = |p: &[u8]| apply_delta(&mut Vec::new(), &base, p);
+        assert!(run(&good).is_ok());
+        let with_op = |op: &[u8]| {
+            let mut b = good[..good.len() - 5].to_vec(); // drop END + CRC
+            b.extend_from_slice(op);
+            b.push(OP_END);
+            let c = crc32fast::hash(&b);
+            b.extend_from_slice(&c.to_be_bytes());
+            b
+        };
+        for (name, op) in [("ADD 0 bytes", &[0x02u8, 0x00][..]), ("ADD 1 byte", &[0x02, 0x01, b'x']), ("COPY 0 bytes", &[0x01, 0x00, 0x00])] {
+            assert!(run(&with_op(op)).is_err(), "{} inside a v2 patch was accepted", name);
+        }
+        let mut b = good[..HDR_LEN].to_vec();
+        b.extend_from_slice(&[0x02, 0x00, 0x00]);
+        let c = crc32fast::hash(&b);
+        b.extend_from_slice(&c.to_be_bytes());
+        assert!(run(&b).is_err(), "a v2 patch starting with ADD was accepted");
+    }
+
+    /// Every overflow record is validated when the file is opened, so a mapping that opens never holds a malformed
+    /// record (same rule in Go, Java, Node and Python).
+    #[test]
+    fn malformed_overflow_records_are_refused_at_open() {
+        let d0 = fx("v2_expected.attos");
+        let n = d0.len();
+        let k = u64::from_be_bytes(d0[n - 24..n - 16].try_into().unwrap()) as usize;
+        let base_end = u64::from_be_bytes(d0[n - 16..n - 8].try_into().unwrap()) as usize;
+        let off_off = base_end + k * 8;
+        let data_off = off_off + (k + 1) * 8;
+        let rec = |d: &[u8], i: usize| data_off + u64::from_le_bytes(d[off_off + i * 8..off_off + i * 8 + 8].try_into().unwrap()) as usize;
+        let fix = |mut d: Vec<u8>| {
+            let c = crc32fast::hash(&d[..d.len() - 4]);
+            let l = d.len();
+            d[l - 4..].copy_from_slice(&c.to_be_bytes());
+            d
+        };
+        assert!(open(&fix(d0.clone())).1.is_ok());
+        let first_value = (0..k).find(|&i| d0[rec(&d0, i) + 2..rec(&d0, i) + 6] != [0xff; 4]).unwrap();
+        let s = rec(&d0, 0);
+        let v = rec(&d0, first_value);
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("keyLen beyond the record", { let mut d = d0.clone(); d[s] = 0xff; d[s + 1] = 0xff; d }),
+            ("valLen beyond the record", { let mut d = d0.clone(); d[s + 2..s + 6].copy_from_slice(&[0, 0x10, 0, 0]); d }),
+            ("valLen one too long", { let mut d = d0.clone(); d[s + 5] = d[s + 5].wrapping_add(1); d }),
+            ("keyLen one too short", { let mut d = d0.clone(); d[s + 1] = d[s + 1].wrapping_sub(1); d }),
+            ("value record turned into a tombstone", { let mut d = d0.clone(); d[v + 2..v + 6].copy_from_slice(&[0xff; 4]); d }),
+        ];
+        for (name, d) in cases {
+            assert!(open(&fix(d)).1.is_err(), "{}: opened", name);
+        }
+    }
 }

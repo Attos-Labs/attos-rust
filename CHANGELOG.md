@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.1 - 2026-11-19
+
+* `AttosClient::reload` and the synchronizer wait for a free retirement slot before mapping a new file, so live + retired + incoming mappings never exceed 1 + `MAX_RETIRED` even while readers are slow to release old maps (the new file used to be mapped first, which could briefly hold one more).
+* Tests: the hot-swap stress test waits for the unmap of a just-retired map before counting mapped regions (it raced with a descheduled thread between the last reference dropping and `munmap`; 0 of 50 failures under CPU load, 4 of 15 before); v1 copy/add ops inside a v2 patch and malformed overflow records are refused (same rules as Go, Java, Node, Python).
+
 ## 1.5.0 - 2026-11-16
 
 * Warm-up by default in the synchronizer: `OpenConfig::warm_up` reads every page of a newly mapped file before it is published (`SyncConfig::new` sets it; opt out with `config.open.warm_up = false`). Without it each hot swap maps a cold file and first-touch page faults added about 350 to 600 ns to P99 at 100k reads/s. Cost: resident memory equals the file size; the validation pass's pages are no longer dropped when warm-up is on. A direct `AttosMap::open` stays lazy.
