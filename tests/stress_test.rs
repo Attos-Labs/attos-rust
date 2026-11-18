@@ -8,6 +8,21 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Number of mapped regions of the test files once the kernel has caught up. A map is dropped in two steps: its
+/// reference count reaches zero (the client stops counting it), then the dropping thread runs `munmap`. A thread that
+/// is descheduled between the two (the host is busy) leaves a retired map visible in /proc/self/maps for a moment, so
+/// sampling the count once is racy. This waits (bounded) for the count to fall to `limit` and returns the smallest
+/// value seen; a real leak never settles and the caller's assertion then fails.
+fn settled_maps(needle: &str, limit: usize) -> usize {
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    let mut best = common::count_maps(needle);
+    while best > limit && Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        best = best.min(common::count_maps(needle));
+    }
+    best
+}
+
 #[test]
 fn hot_swap_stress_32_readers_1000_swaps() {
     let dir = tempfile::tempdir().unwrap();
@@ -84,7 +99,7 @@ fn hot_swap_stress_32_readers_1000_swaps() {
         client.reload(&paths[i % gens]).unwrap();
         max_pending = max_pending.max(client.pending_retired());
         if i % 50 == 0 {
-            max_maps = max_maps.max(common::count_maps(&needle));
+            max_maps = max_maps.max(settled_maps(&needle, 1 + attos_client::sync::MAX_RETIRED));
         }
     }
     let elapsed = start.elapsed();

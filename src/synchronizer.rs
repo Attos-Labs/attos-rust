@@ -1027,6 +1027,10 @@ async fn sync_attempt(
             return Err(if is_patch { Fail::Delta(e) } else { fail(e) });
         }
     }
+    // Keep the number of mapped files bounded: wait for a retirement slot before mapping the new file.
+    if let Some(c) = client.as_ref() {
+        c.wait_for_retire_slot();
+    }
     // Validate the complete file (magic, version, flag, sizes, CRC) before it can become visible.
     let map = match AttosMap::open_inner(&tmp, inner.cfg.open, true) {
         Ok(m) => m,

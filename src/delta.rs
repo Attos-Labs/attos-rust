@@ -249,7 +249,7 @@ mod tests {
         assert_eq!(sha(&fx("v2_expected.attos")), EXPECTED_SHA);
         // The constants above must be the ones the workspace manifest pins (checked when it is present).
         let m = format!(
-            "{}/../testdata/golden/MANIFEST.md",
+            "{}/../../testdata/golden/MANIFEST.md",
             env!("CARGO_MANIFEST_DIR")
         );
         if let Ok(text) = std::fs::read_to_string(m) {

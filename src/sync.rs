@@ -123,10 +123,36 @@ impl AttosClient {
     #[instrument(skip(self, path), fields(path = %path.as_ref().display()))]
     pub fn reload<P: AsRef<Path>>(&self, path: P) -> Result<(), AttosError> {
         info!("Reloading AttosMap from new path");
+        // Reserve a retirement slot BEFORE mapping the new file, so live + retired + incoming mappings never
+        // exceed 1 + MAX_RETIRED (opening first would hold a 4th mapping while waiting for readers to drain).
+        self.wait_for_retire_slot();
         let new_map = AttosMap::open_with_config(path, self.config)?;
         self.swap_map(new_map)?;
         info!("Successfully hot-swapped AttosMap");
         Ok(())
+    }
+
+    /// Blocks until fewer than `MAX_RETIRED` replaced maps are still referenced by readers, i.e. until the next
+    /// swap will not have to wait. Called before a new file is mapped so that the number of mapped regions stays
+    /// at most `1 + MAX_RETIRED` even while readers are slow to release old maps. `swap_map` re-checks under its
+    /// lock, so calling this is an optimisation of the bound, not a requirement for correctness.
+    pub(crate) fn wait_for_retire_slot(&self) {
+        let mut waited = Duration::ZERO;
+        loop {
+            {
+                let mut retired = self.shared.retired.lock().unwrap();
+                retired.retain(|w| w.strong_count() > 0);
+                if retired.len() < MAX_RETIRED {
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            waited += Duration::from_millis(1);
+            #[allow(clippy::manual_is_multiple_of)]
+            if waited.as_millis() % 5000 == 0 {
+                warn!("hot-swap waiting: {} retired maps still referenced by readers", MAX_RETIRED);
+            }
+        }
     }
 
     /// Publish an already-validated map (used by the synchronizer).
