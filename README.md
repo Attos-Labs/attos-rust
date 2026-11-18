@@ -97,7 +97,16 @@ let value = map.get_string("user_123")?;
 | `node_id` | `ATTOS_NODE_ID`, then the hostname. Nodes are counted by distinct ID. |
 | `compression` | `true` (gzip transfer copy) |
 | `telemetry_interval` | 60s; `Duration::ZERO` disables telemetry |
-| `open` | `OpenConfig`: checksum validation and memory pinning |
+| `open` | `OpenConfig`: checksum validation, memory pinning and `warm_up`. `SyncConfig::new` sets `warm_up` to `true`, so each newly mapped file is read into memory before it is published (resident memory equals the file size); set `cfg.open.warm_up = false` for lazy mapping. |
+| `telemetry_base_url`, `telemetry_api_key` | Send telemetry to a different endpoint or with a different key. Default `None`. |
+| `http_timeout` | Timeout for sync requests. Default 600s. |
+| `delta` | Request and apply delta patches. Default `true`. See `AttosSynchronizer::delta_stats`. |
+| `redirect` | Accept signed-download redirects. Default `true`. See `AttosSynchronizer::redirect_stats`. |
+| `redirect_hosts` | Extra hosts a signed download may come from, on top of `storage.googleapis.com` and `*.storage.googleapis.com`; `ATTOS_REDIRECT_HOSTS` (comma separated) is added. Exact hosts or `*.domain`; https on port 443 only. |
+| `redirect_cooldown` | How long redirects stay off after a failed signed download. Default 3600s. |
+| `signature_keys` | Trusted Ed25519 public keys by key id (`HashMap<String, [u8; 32]>`, decode with `parse_public_key`). Any key enforces signed artifacts: unsigned or invalid files are refused (`AttosError::SignatureMissing`, `SignatureInvalid`) and the current map keeps serving. Default empty. |
+
+Polling waits the interval plus a random share of up to half of it (30 to 45 s at the default).
 
 ## Errors
 
