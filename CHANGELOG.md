@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+* Patch updates simplified: the copy/add patch (ATDL v1) is gone; the overflow tail patch (ATDL v2) is the only patch type, negotiated by `X-Attos-Capabilities: patch` (replacing `overflow` and `X-Attos-Accept-Delta`, no longer sent). It applies to any file that starts with the chain's main blob, so a node several versions behind takes the same one patch as a node one behind. The patch header's base size and CRC are no longer checked; the target SHA-256 proves the rebuild. `SyncConfig::delta` still turns it off.
+* The redirect cooldown is fixed at one hour; `SyncConfig::redirect_cooldown` is removed.
+
 ## 1.5.1 - 2026-11-19
 
 * `AttosClient::reload` and the synchronizer wait for a free retirement slot before mapping a new file, so live + retired + incoming mappings never exceed 1 + `MAX_RETIRED` even while readers are slow to release old maps (the new file used to be mapped first, which could briefly hold one more).

@@ -1,12 +1,13 @@
-//! Delta sync (attos-cloud/docs/DELTA_UPDATES.md, OVERFLOW_SHIPPED.md). A node that is one version behind
-//! downloads an "ATDL" patch instead of the whole blob and rebuilds the new blob into a temp file from its
-//! current file; the result then goes through the same CRC validation, rename and atomic publish as a full
-//! download.
+//! Patch sync (attos-cloud/docs/PATCH_UPDATES.md). A node that holds the main blob of the server's overflow chain,
+//! or any variant of it, downloads one small "ATDL" tail patch instead of the whole file and rebuilds the new file
+//! into a temp file from its current file; the result then goes through the same CRC validation, rename and atomic
+//! publish as a full download.
 //!
-//! Patch layout (big-endian): `"ATDL" | u32 version | u64 baseSize | u32 baseCRC (the base's CRC32 trailer)
-//! | u64 targetSize | [32]byte targetSHA256 | ops | u32 CRC32 of all preceding bytes`.
-//! Version 1 ops: `0x00` END, `0x01` COPY uvarint(baseOff) uvarint(len), `0x02` ADD uvarint(len) bytes.
-//! Version 2 (tail patch) op: `0x01` TRUNCATE_AND_APPEND `u64 baseEnd | u64 payloadLen | payload`, then END.
+//! Patch layout (big-endian): `"ATDL" | u32 version=2 | u64 baseSize | u32 baseCRC | u64 targetSize |
+//! [32]byte targetSHA256 | op 0x01 TRUNCATE_AND_APPEND u64 baseEnd | u64 payloadLen | payload | op 0x00 END |
+//! u32 CRC32 of all preceding bytes`. The new file is the first baseEnd bytes of the base (header flag bit set)
+//! followed by the payload. baseSize and baseCRC describe the base the server built the patch from and are not
+//! checked: the patch applies to any file that starts with the same main blob, and the target SHA-256 proves it did.
 
 use crate::error::AttosError;
 use crate::overflow::FLAG_OVERFLOW;
@@ -16,19 +17,10 @@ use std::io::{Read, Write};
 const MAGIC: &[u8; 4] = b"ATDL";
 const HDR_LEN: usize = 60;
 const OP_END: u8 = 0;
-const OP_COPY: u8 = 1;
-const OP_ADD: u8 = 2;
 const OP_TRUNC_APPEND: u8 = 1;
 
 pub(crate) fn corrupt(m: impl std::fmt::Display) -> AttosError {
     AttosError::Transport(format!("corrupt delta patch: {}", m))
-}
-
-fn wrong_base(m: impl std::fmt::Display) -> AttosError {
-    AttosError::Transport(format!(
-        "delta patch does not apply to the current file: {}",
-        m
-    ))
 }
 
 /// Reads exactly the bytes handed to the caller and CRCs them (no read-ahead is hashed).
@@ -52,22 +44,6 @@ impl<R: Read> CrcRead<R> {
         Ok(b[0])
     }
 
-    fn uvarint(&mut self) -> Result<u64, AttosError> {
-        let (mut x, mut s) = (0u64, 0u32);
-        for i in 0..10 {
-            let b = self.byte()?;
-            if b < 0x80 {
-                if i == 9 && b > 1 {
-                    break;
-                }
-                return Ok(x | (b as u64) << s);
-            }
-            x |= ((b & 0x7f) as u64) << s;
-            s += 7;
-        }
-        Err(corrupt("varint overflow"))
-    }
-
     /// Copies exactly `n` patch bytes to `out`.
     fn copy_to(
         &mut self,
@@ -87,7 +63,7 @@ impl<R: Read> CrcRead<R> {
 }
 
 /// Applies `patch` to `base` (the complete current file) and writes the rebuilt target to `dst`. Verifies the
-/// patch CRC, base identity, op bounds, the produced size and the target SHA-256; on any error `dst` may hold
+/// patch CRC, op bounds, the produced size and the target SHA-256; on any error `dst` may hold
 /// partial output and must be discarded. Returns the target SHA-256.
 pub(crate) fn apply_delta<R: Read, W: Write>(
     dst: &mut W,
@@ -101,25 +77,12 @@ pub(crate) fn apply_delta<R: Read, W: Write>(
     let mut hdr = [0u8; HDR_LEN];
     br.exact(&mut hdr).map_err(|_| corrupt("header"))?;
     let version = u32::from_be_bytes(hdr[4..8].try_into().unwrap());
-    if &hdr[..4] != MAGIC || (version != 1 && version != 2) {
+    if &hdr[..4] != MAGIC || version != 2 {
         return Err(corrupt("bad magic or version"));
     }
-    let tail_patch = version == 2;
-    let base_size = u64::from_be_bytes(hdr[8..16].try_into().unwrap());
-    let base_crc = u32::from_be_bytes(hdr[16..20].try_into().unwrap());
+    let base_size = base.len() as u64;
     let target_size = u64::from_be_bytes(hdr[20..28].try_into().unwrap());
     let target_sha: [u8; 32] = hdr[28..60].try_into().unwrap();
-    if base_size != base.len() as u64 {
-        return Err(wrong_base(format!(
-            "base size {}, patch expects {}",
-            base.len(),
-            base_size
-        )));
-    }
-    if base.len() < 4 || u32::from_be_bytes(base[base.len() - 4..].try_into().unwrap()) != base_crc
-    {
-        return Err(wrong_base("base CRC differs"));
-    }
     let mut sha = Sha256::new();
     let mut produced = 0u64;
     let emit = |b: &[u8], sha: &mut Sha256, dst: &mut W| -> Result<(), AttosError> {
@@ -128,7 +91,7 @@ pub(crate) fn apply_delta<R: Read, W: Write>(
     };
     loop {
         let op = br.byte()?;
-        if tail_patch && op == OP_TRUNC_APPEND {
+        if op == OP_TRUNC_APPEND {
             if produced != 0 {
                 return Err(corrupt("second tail op"));
             }
@@ -136,7 +99,8 @@ pub(crate) fn apply_delta<R: Read, W: Write>(
             br.exact(&mut ph)?;
             let base_end = u64::from_be_bytes(ph[..8].try_into().unwrap());
             let plen = u64::from_be_bytes(ph[8..].try_into().unwrap());
-            if base_end > base_size - 4
+            if base_size < 4
+                || base_end > base_size - 4
                 || base_end < 64
                 || plen > target_size
                 || base_end != target_size - plen
@@ -176,22 +140,6 @@ pub(crate) fn apply_delta<R: Read, W: Write>(
                     return Err(corrupt("target SHA-256 mismatch"));
                 }
                 return Ok(target_sha);
-            }
-            OP_COPY | OP_ADD if !tail_patch => {
-                let off = if op == OP_COPY { br.uvarint()? } else { 0 };
-                let n = br.uvarint()?;
-                if n > target_size - produced {
-                    return Err(corrupt("op overruns target"));
-                }
-                if op == OP_COPY {
-                    if off > base_size || n > base_size - off {
-                        return Err(corrupt("copy outside base"));
-                    }
-                    emit(&base[off as usize..(off + n) as usize], &mut sha, dst)?;
-                } else {
-                    br.copy_to(n, &mut |b| emit(b, &mut sha, dst))?;
-                }
-                produced += n;
             }
             _ => return Err(corrupt(format!("unknown op {:#x}", op))),
         }
@@ -359,11 +307,19 @@ mod tests {
                 && run(&base, b"ATDL").is_err()
                 && run(&base, &[0u8; 80]).is_err()
         );
-        // wrong base: other size, or same size with a different CRC trailer
-        assert!(run(&fx("v2_expected.attos"), &patch).is_err(), "wrong base");
+        // a different main blob rebuilds a file with another SHA-256: refused
         let mut b2 = base.clone();
-        *b2.last_mut().unwrap() ^= 1;
-        assert!(run(&b2, &patch).is_err(), "base CRC differs");
+        b2[100] ^= 1;
+        assert!(run(&b2, &patch).is_err(), "a different main blob");
+        // any file that starts with the same main blob is a base: the previous variant takes the same patch
+        assert!(
+            run(&fx("v2_expected.attos"), &patch).is_ok(),
+            "a variant of the chain"
+        );
+        // version 1 (copy/add) patches no longer exist
+        let mut v1 = patch.clone();
+        v1[4..8].copy_from_slice(&1u32.to_be_bytes());
+        assert!(run(&base, &v1).is_err(), "version 1 patch");
         // the good case still works
         assert!(run(&base, &patch).is_ok());
     }
@@ -461,57 +417,12 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn copy_add_patch_v1_applies() {
-        // Hand-built ATDL v1: target = base[0..70] + "XY" + base[70..], with a recomputed trailer.
-        let base = fx("v1_base.attos");
-        let mut target = base.clone();
-        target.splice(70..70, *b"XY");
-        let mut p = Vec::new();
-        p.extend_from_slice(b"ATDL");
-        p.extend_from_slice(&1u32.to_be_bytes());
-        p.extend_from_slice(&(base.len() as u64).to_be_bytes());
-        p.extend_from_slice(&base[base.len() - 4..]);
-        p.extend_from_slice(&(target.len() as u64).to_be_bytes());
-        let mut s = Sha256::new();
-        s.update(&target);
-        p.extend_from_slice(&s.finish());
-        let uv = |p: &mut Vec<u8>, mut x: u64| {
-            while x >= 0x80 {
-                p.push((x as u8) | 0x80);
-                x >>= 7;
-            }
-            p.push(x as u8);
-        };
-        p.push(OP_COPY);
-        uv(&mut p, 0);
-        uv(&mut p, 70);
-        p.push(OP_ADD);
-        uv(&mut p, 2);
-        p.extend_from_slice(b"XY");
-        p.push(OP_COPY);
-        uv(&mut p, 70);
-        uv(&mut p, base.len() as u64 - 70);
-        p.push(OP_END);
-        let c = crc32fast::hash(&p);
-        p.extend_from_slice(&c.to_be_bytes());
-        let mut out = Vec::new();
-        apply_delta(&mut out, &base, &p[..]).unwrap();
-        assert_eq!(out, target);
-        // a mangled op stream with a valid patch CRC is still refused (bad op / bounds / SHA)
-        let mut bad = p.clone();
-        bad[HDR_LEN + 1] = 0xff;
-        bad[HDR_LEN + 2] = 0x7f;
-        let n = bad.len();
-        let c = crc32fast::hash(&bad[..n - 4]);
-        bad[n - 4..].copy_from_slice(&c.to_be_bytes());
-        assert!(apply_delta(&mut Vec::new(), &base, &bad[..]).is_err());
-    }
-
     /// A v2 patch is one TRUNCATE_AND_APPEND op plus END; the v1 copy/add ops are not part of it, even when the rest of
     /// the patch is valid (same rule in Go, Java, Node and Python).
     #[test]
     fn v2_patch_refuses_version_1_ops() {
+        const OP_COPY: u8 = 1;
+        let _ = OP_COPY;
         let base = fx("v1_base.attos");
         let good = fx("v1_to_v2_tail.patch");
         let run = |p: &[u8]| apply_delta(&mut Vec::new(), &base, p);
@@ -524,14 +435,25 @@ mod tests {
             b.extend_from_slice(&c.to_be_bytes());
             b
         };
-        for (name, op) in [("ADD 0 bytes", &[0x02u8, 0x00][..]), ("ADD 1 byte", &[0x02, 0x01, b'x']), ("COPY 0 bytes", &[0x01, 0x00, 0x00])] {
-            assert!(run(&with_op(op)).is_err(), "{} inside a v2 patch was accepted", name);
+        for (name, op) in [
+            ("ADD 0 bytes", &[0x02u8, 0x00][..]),
+            ("ADD 1 byte", &[0x02, 0x01, b'x']),
+            ("COPY 0 bytes", &[0x01, 0x00, 0x00]),
+        ] {
+            assert!(
+                run(&with_op(op)).is_err(),
+                "{} inside a v2 patch was accepted",
+                name
+            );
         }
         let mut b = good[..HDR_LEN].to_vec();
         b.extend_from_slice(&[0x02, 0x00, 0x00]);
         let c = crc32fast::hash(&b);
         b.extend_from_slice(&c.to_be_bytes());
-        assert!(run(&b).is_err(), "a v2 patch starting with ADD was accepted");
+        assert!(
+            run(&b).is_err(),
+            "a v2 patch starting with ADD was accepted"
+        );
     }
 
     /// Every overflow record is validated when the file is opened, so a mapping that opens never holds a malformed
@@ -544,7 +466,11 @@ mod tests {
         let base_end = u64::from_be_bytes(d0[n - 16..n - 8].try_into().unwrap()) as usize;
         let off_off = base_end + k * 8;
         let data_off = off_off + (k + 1) * 8;
-        let rec = |d: &[u8], i: usize| data_off + u64::from_le_bytes(d[off_off + i * 8..off_off + i * 8 + 8].try_into().unwrap()) as usize;
+        let rec = |d: &[u8], i: usize| {
+            data_off
+                + u64::from_le_bytes(d[off_off + i * 8..off_off + i * 8 + 8].try_into().unwrap())
+                    as usize
+        };
         let fix = |mut d: Vec<u8>| {
             let c = crc32fast::hash(&d[..d.len() - 4]);
             let l = d.len();
@@ -552,15 +478,38 @@ mod tests {
             d
         };
         assert!(open(&fix(d0.clone())).1.is_ok());
-        let first_value = (0..k).find(|&i| d0[rec(&d0, i) + 2..rec(&d0, i) + 6] != [0xff; 4]).unwrap();
+        let first_value = (0..k)
+            .find(|&i| d0[rec(&d0, i) + 2..rec(&d0, i) + 6] != [0xff; 4])
+            .unwrap();
         let s = rec(&d0, 0);
         let v = rec(&d0, first_value);
         let cases: Vec<(&str, Vec<u8>)> = vec![
-            ("keyLen beyond the record", { let mut d = d0.clone(); d[s] = 0xff; d[s + 1] = 0xff; d }),
-            ("valLen beyond the record", { let mut d = d0.clone(); d[s + 2..s + 6].copy_from_slice(&[0, 0x10, 0, 0]); d }),
-            ("valLen one too long", { let mut d = d0.clone(); d[s + 5] = d[s + 5].wrapping_add(1); d }),
-            ("keyLen one too short", { let mut d = d0.clone(); d[s + 1] = d[s + 1].wrapping_sub(1); d }),
-            ("value record turned into a tombstone", { let mut d = d0.clone(); d[v + 2..v + 6].copy_from_slice(&[0xff; 4]); d }),
+            ("keyLen beyond the record", {
+                let mut d = d0.clone();
+                d[s] = 0xff;
+                d[s + 1] = 0xff;
+                d
+            }),
+            ("valLen beyond the record", {
+                let mut d = d0.clone();
+                d[s + 2..s + 6].copy_from_slice(&[0, 0x10, 0, 0]);
+                d
+            }),
+            ("valLen one too long", {
+                let mut d = d0.clone();
+                d[s + 5] = d[s + 5].wrapping_add(1);
+                d
+            }),
+            ("keyLen one too short", {
+                let mut d = d0.clone();
+                d[s + 1] = d[s + 1].wrapping_sub(1);
+                d
+            }),
+            ("value record turned into a tombstone", {
+                let mut d = d0.clone();
+                d[v + 2..v + 6].copy_from_slice(&[0xff; 4]);
+                d
+            }),
         ];
         for (name, d) in cases {
             assert!(open(&fix(d)).1.is_err(), "{}: opened", name);

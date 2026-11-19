@@ -109,9 +109,9 @@ fn requests_advertise_overflow_and_redirect() {
     let q = &r[0].1;
     assert_eq!(
         q.get("x-attos-capabilities").map(String::as_str),
-        Some("overflow,redirect")
+        Some("patch,redirect")
     );
-    assert_eq!(q.get("x-attos-accept-delta").map(String::as_str), Some("2"));
+    assert!(q.get("x-attos-accept-delta").is_none());
     assert!(q.get("x-attos-no-redirect").is_none());
     drop(r);
     // disabled features are not advertised
@@ -205,7 +205,7 @@ fn redirect_to_a_host_outside_the_allowlist_is_refused_and_backs_off() {
     }));
     let dir = tempfile::tempdir().unwrap();
     let mut c = cfg(&format!("http://{}", api.addr), dir.path());
-    c.redirect_cooldown = Duration::from_millis(600);
+    c.test_redirect_cooldown = Some(Duration::from_millis(600));
     let s = AttosSynchronizer::start(c).unwrap();
     // The first sync: redirect refused (http, loopback) → repeated through the endpoint with No-Redirect.
     assert_eq!(val(&s, "key_1").unwrap(), "val_1");
@@ -357,13 +357,12 @@ fn patch_server(patch: Vec<u8>) -> (Srv, Arc<Mutex<u32>>) {
             return (200, vec![h("ETag", "\"v1\"")], base.clone());
         }
         if q.get("x-attos-capabilities")
-            .map_or(false, |c| c.contains("overflow"))
+            .map_or(false, |c| c.contains("patch"))
         {
             return (
                 200,
                 vec![
                     h("X-Attos-Delta", "1"),
-                    h("X-Attos-Delta-Base-ETag", "\"v1\""),
                     h(
                         "X-Attos-Delta-Target-SHA256",
                         "3f1d70c6fe07303e162d50266ceb2c6d292df1c54227016114520bef216164ab",
@@ -426,7 +425,7 @@ fn damaged_patch_falls_back_to_the_full_file() {
     assert!(last.get("x-attos-accept-delta").is_none());
     assert!(!last
         .get("x-attos-capabilities")
-        .map_or(false, |c| c.contains("overflow")));
+        .map_or(false, |c| c.contains("patch")));
     assert!(is_sync(&r[0].0));
 }
 
@@ -478,13 +477,12 @@ fn signed_tail_patch_is_verified_on_the_rebuilt_file() {
                 };
             }
             if q.get("x-attos-capabilities")
-                .map_or(false, |c| c.contains("overflow"))
+                .map_or(false, |c| c.contains("patch"))
             {
                 return (
                     200,
                     vec![
                         h("X-Attos-Delta", "1"),
-                        h("X-Attos-Delta-Base-ETag", "\"v1\""),
                         h("ETag", "\"v2\""),
                         h("X-Attos-Signature", &sig_exp),
                     ],
