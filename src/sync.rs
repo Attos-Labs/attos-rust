@@ -150,7 +150,10 @@ impl AttosClient {
             waited += Duration::from_millis(1);
             #[allow(clippy::manual_is_multiple_of)]
             if waited.as_millis() % 5000 == 0 {
-                warn!("hot-swap waiting: {} retired maps still referenced by readers", MAX_RETIRED);
+                warn!(
+                    "hot-swap waiting: {} retired maps still referenced by readers",
+                    MAX_RETIRED
+                );
             }
         }
     }

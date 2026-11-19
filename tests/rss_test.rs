@@ -74,17 +74,45 @@ fn warm_up_makes_the_mapping_resident() {
     let path = p.to_str().unwrap();
     let size = std::fs::metadata(&p).unwrap().len();
 
-    let cold = AttosMap::open_with_config(path, OpenConfig { validate_checksum: true, ..Default::default() }).unwrap();
+    let cold = AttosMap::open_with_config(
+        path,
+        OpenConfig {
+            validate_checksum: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let cold_frac = mapped_rss(path) as f64 / size as f64;
     drop(cold);
     for (name, cfg) in [
-        ("warm_up", OpenConfig { warm_up: true, ..Default::default() }),
-        ("warm_up + validate", OpenConfig { warm_up: true, validate_checksum: true, ..Default::default() }),
+        (
+            "warm_up",
+            OpenConfig {
+                warm_up: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "warm_up + validate",
+            OpenConfig {
+                warm_up: true,
+                validate_checksum: true,
+                ..Default::default()
+            },
+        ),
     ] {
         let m = AttosMap::open_with_config(path, cfg).unwrap();
         let frac = mapped_rss(path) as f64 / size as f64;
-        assert!(frac > 0.95, "{name}: {:.1}% of the file resident, want ~100%", frac * 100.0);
-        assert!(cold_frac < 0.5, "the cold validated open should stay mostly non-resident (got {:.1}%)", cold_frac * 100.0);
+        assert!(
+            frac > 0.95,
+            "{name}: {:.1}% of the file resident, want ~100%",
+            frac * 100.0
+        );
+        assert!(
+            cold_frac < 0.5,
+            "the cold validated open should stay mostly non-resident (got {:.1}%)",
+            cold_frac * 100.0
+        );
         assert_eq!(m.get(b"key_77").unwrap().len(), 1000);
     }
 }
@@ -92,7 +120,10 @@ fn warm_up_makes_the_mapping_resident() {
 #[test]
 fn synchronizer_config_warms_by_default_and_can_opt_out() {
     let c = attos_client::SyncConfig::new("http://127.0.0.1:1", "k", "ds");
-    assert!(c.open.warm_up, "the synchronizer pre-faults new mappings by default");
+    assert!(
+        c.open.warm_up,
+        "the synchronizer pre-faults new mappings by default"
+    );
     assert!(!OpenConfig::default().warm_up, "a direct open stays lazy");
     let mut c = c;
     c.open.warm_up = false;

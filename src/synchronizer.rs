@@ -63,7 +63,7 @@ pub struct SyncConfig {
     pub telemetry_retry_delays: Vec<Duration>,
     /// Base unit of the transient back-off (default 1 s). Exposed for tests.
     pub backoff_base: Duration,
-    /// Ask for patches (`X-Attos-Capabilities: overflow`, `X-Attos-Accept-Delta: 2`; default true). A patch that
+    /// Ask for patches (`X-Attos-Capabilities: patch`; default true). A patch that
     /// fails to apply is retried as a full blob either way.
     pub delta: bool,
     /// Ask for signed redirects (`X-Attos-Capabilities: redirect`; default true).
@@ -73,8 +73,9 @@ pub struct SyncConfig {
     /// `ATTOS_REDIRECT_HOSTS` environment variable (comma separated) is added to them. Targets must be https
     /// on port 443 without userinfo.
     pub redirect_hosts: Vec<String>,
-    /// How long redirects stay off after a signed download failed (default 1 h).
-    pub redirect_cooldown: Duration,
+    /// Tests only: replaces the fixed one-hour period during which redirects stay off after a signed download failed.
+    #[doc(hidden)]
+    pub test_redirect_cooldown: Option<Duration>,
     /// Tests against local servers only: lifts the redirect host policy (http, IP literals, any host).
     pub test_redirect_any_target: bool,
     /// Trusted Ed25519 public keys by key id (see [`crate::signature`]). When non-empty, signed artifacts are
@@ -98,7 +99,10 @@ impl SyncConfig {
             compression: true,
             poll_interval: DEFAULT_SYNC_INTERVAL,
             // Pre-fault newly mapped files before they are published (see OpenConfig::warm_up); opt out with open.warm_up = false.
-            open: OpenConfig { warm_up: true, ..OpenConfig::default() },
+            open: OpenConfig {
+                warm_up: true,
+                ..OpenConfig::default()
+            },
             telemetry_interval: DEFAULT_TELEMETRY_INTERVAL,
             telemetry_base_url: None,
             telemetry_api_key: None,
@@ -112,7 +116,7 @@ impl SyncConfig {
             delta: true,
             redirect: true,
             redirect_hosts: Vec::new(),
-            redirect_cooldown: Duration::from_secs(3600),
+            test_redirect_cooldown: None,
             test_redirect_any_target: false,
             signature_keys: HashMap::new(),
         }
@@ -677,7 +681,7 @@ fn hv(r: &reqwest::header::HeaderMap, k: &str) -> Option<String> {
 }
 
 /// One sync, with the fallbacks of the Go SDK: a failed signed download is repeated through the endpoint
-/// (`X-Attos-No-Redirect: 1`) and switches redirects off for `redirect_cooldown`; a failed patch is repeated
+/// (`X-Attos-No-Redirect: 1`) and switches redirects off for an hour; a failed patch is repeated
 /// without delta capabilities, i.e. as a full blob.
 async fn sync_once(
     inner: &Inner,
@@ -694,8 +698,8 @@ async fn sync_once(
                 // Stop asking for a while: a node that cannot reach the download host would otherwise be handed
                 // a URL, fail, and stream the same bytes through the endpoint on every sync, billed twice each time.
                 *inner.redirect_off.lock().unwrap() =
-                    Some(Instant::now() + inner.cfg.redirect_cooldown);
-                warn!("signed download failed ({}); fetching through the sync endpoint, no redirects for {:?}", e, inner.cfg.redirect_cooldown);
+                    Some(Instant::now() + redirect_cooldown(&inner.cfg));
+                warn!("signed download failed ({}); fetching through the sync endpoint, no redirects for {:?}", e, redirect_cooldown(&inner.cfg));
                 allow_redirect = false;
             }
             Err(Fail::Delta(e)) if allow_delta => {
@@ -752,8 +756,7 @@ fn sync_request(
     // overflow-capable file that later tail patches build on.
     let mut caps: Vec<&str> = Vec::new();
     if allow_delta {
-        req = req.header("X-Attos-Accept-Delta", "2");
-        caps.push("overflow");
+        caps.push("patch");
     }
     if allow_redirect {
         caps.push("redirect");
@@ -1152,25 +1155,13 @@ fn verify_cached(i: &Inner, live: &std::path::Path) -> Result<(), AttosError> {
 }
 
 /// Rebuilds the new blob into `dst` from the live file and the downloaded patch (`patch_path`). The patch's
-/// base tag must be the tag this node holds, and its target SHA-256 must match the server's header.
+/// target SHA-256 must match the server's header.
 fn rebuild_from_patch(
     inner: &Inner,
     headers: &reqwest::header::HeaderMap,
     patch_path: &std::path::Path,
     dst: &std::path::Path,
 ) -> Result<(), AttosError> {
-    let mut have = inner.etag.lock().unwrap().clone().unwrap_or_default();
-    if let Some(raw) = have.strip_suffix("-gzip\"") {
-        // the raw tag of the same version
-        have = format!("{}\"", raw);
-    }
-    let base_tag = hv(headers, "x-attos-delta-base-etag").unwrap_or_default();
-    if base_tag != have {
-        return Err(AttosError::Transport(format!(
-            "patch is for base {}, this node has {}",
-            base_tag, have
-        )));
-    }
     let live = fs::File::open(live_path(inner))?;
     // SAFETY: the live file is replaced only by an atomic rename of a fresh file, never written in place.
     let base = unsafe { memmap2::Mmap::map(&live) }?;
@@ -1189,6 +1180,12 @@ fn rebuild_from_patch(
         }
     }
     Ok(())
+}
+
+/// How long redirects stay off after a signed download failed: one hour (fixed; tests may shorten it).
+fn redirect_cooldown(cfg: &SyncConfig) -> Duration {
+    cfg.test_redirect_cooldown
+        .unwrap_or(Duration::from_secs(3600))
 }
 
 /// Snapshot the window and enqueue (drop-newest on a full queue).
