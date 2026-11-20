@@ -580,7 +580,7 @@ impl AttosMap {
 
     /// Iterates all non-empty slots in the values table.
     ///
-    /// Order is determined by MPHF slot assignment (not insertion order).
+    /// Order is determined by index slot assignment (not insertion order).
     /// The callback receives zero-copy references into the mmap. Return
     /// `false` to halt early.
     pub fn scan<F>(&self, mut callback: F)
